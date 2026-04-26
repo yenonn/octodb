@@ -1395,3 +1395,117 @@ func TestConcurrentWriteAndCompaction(t *testing.T) {
 	st2.Close()
 }
 
+// TestConcurrentWriteAndDelete verifies writes don't race with deletes.
+func TestConcurrentWriteAndDelete(t *testing.T) {
+	st, _ := setupTestStore(t)
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				span := makeTestTrace(fmt.Sprintf("del-svc-%d", idx), fmt.Sprintf("span-%d", j), now+uint64(idx*100+j))
+				if err := st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span}); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(i)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		time.Sleep(50 * time.Millisecond)
+		req := TraceReadRequest{TenantID: "default", Service: "del-svc-0"}
+		if err := st.DeleteTraces(ctx, "default", req); err != nil {
+			errCh <- err
+		}
+	}()
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent error: %v", err)
+		}
+	}
+
+	result, err := st.ReadTraces(ctx, TraceReadRequest{TenantID: "default"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(result) == 0 {
+		t.Fatalf("expected traces after concurrent write+delete")
+	}
+
+	st.Close()
+}
+
+// TestConcurrentFlushAndTombstoneCleanup verifies flush doesn't race with tombstone cleanup.
+func TestConcurrentFlushAndTombstoneCleanup(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	st, err := NewBlock2StoreWithConfig(dataDir, StoreConfig{
+		MemtableFlushThreshold: 1024,
+	})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	for i := 0; i < 10; i++ {
+		span := makeTestTrace("flush-svc", fmt.Sprintf("span-%d", i), now+uint64(i))
+		if err := st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	b := st.(*block2Store)
+	_ = b.flushBundle(b.traceBundle)
+	_ = b.flushBundle(b.logBundle)
+	_ = b.flushBundle(b.metricBundle)
+
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		b.cleanupWALTombstones(b.traceBundle)
+	}()
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			span := makeTestTrace("flush-svc-new", fmt.Sprintf("span-%d", idx), now+uint64(idx+1000))
+			if err := st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span}); err != nil {
+				errCh <- err
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("concurrent error: %v", err)
+		}
+	}
+
+	st.Close()
+}
+

@@ -950,8 +950,6 @@ func (s *block2Store) flushMonitor() {
 // ---------------------------------------------------------------------------
 // TTL + Compaction sweeper
 // ---------------------------------------------------------------------------
-// TTL + Compaction sweeper
-// ---------------------------------------------------------------------------
 
 func (s *block2Store) ttlAndCompactionSweep() {
 	defer s.flushDone.Done()
@@ -986,8 +984,12 @@ func (s *block2Store) ttlAndCompactionSweep() {
 // ---------------------------------------------------------------------------
 
 func (s *block2Store) DeleteTraces(ctx context.Context, tenantID string, req TraceReadRequest) error {
+	b := s.traceBundle
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	// Find matching traces and insert tombstones.
-	active, flushing := s.traceBundle.set.Snapshot()
+	active, flushing := b.set.Snapshot()
 	for _, tbl := range []*memtable.Memtable{active, flushing} {
 		if tbl == nil {
 			continue
@@ -1013,7 +1015,11 @@ func (s *block2Store) DeleteTraces(ctx context.Context, tenantID string, req Tra
 }
 
 func (s *block2Store) DeleteLogs(ctx context.Context, tenantID string, req LogReadRequest) error {
-	active, flushing := s.logBundle.set.Snapshot()
+	b := s.logBundle
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	active, flushing := b.set.Snapshot()
 	for _, tbl := range []*memtable.Memtable{active, flushing} {
 		if tbl == nil {
 			continue
@@ -1037,7 +1043,11 @@ func (s *block2Store) DeleteLogs(ctx context.Context, tenantID string, req LogRe
 }
 
 func (s *block2Store) DeleteMetrics(ctx context.Context, tenantID string, req MetricReadRequest) error {
-	active, flushing := s.metricBundle.set.Snapshot()
+	b := s.metricBundle
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	active, flushing := b.set.Snapshot()
 	for _, tbl := range []*memtable.Memtable{active, flushing} {
 		if tbl == nil {
 			continue
@@ -1105,6 +1115,9 @@ func (s *block2Store) cleanupWALTombstones(b *signalBundle) {
 	if b == nil {
 		return
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	matches, _ := filepath.Glob(filepath.Join(b.walDir, "*.wal.tombstone"))
 	for _, m := range matches {
 		_ = os.Remove(m)
