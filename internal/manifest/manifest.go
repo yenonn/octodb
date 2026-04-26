@@ -32,6 +32,42 @@ type SortKey struct {
 	Service  string `json:"service"`
 	TimeNano uint64 `json:"time"`
 	SpanID   string `json:"span_id"`
+	Str      string `json:"_str"` // original sort key string for ordering
+}
+
+// SortKeyFromString converts a raw memtable sort key string into a manifest SortKey.
+// It does a best-effort parse; caller should ensure the string was generated
+// by otelutil.TraceSortKey.Key() or otelutil.LogSortKey.Key().
+func SortKeyFromString(s string) SortKey {
+	parts := splitNul(s)
+	k := SortKey{Str: s}
+	if len(parts) > 0 {
+		k.TenantID = parts[0]
+	}
+	if len(parts) > 1 {
+		k.Service = parts[1]
+	}
+	if len(parts) > 2 {
+		if v, err := strconv.ParseUint(parts[2], 16, 64); err == nil {
+			k.TimeNano = v
+		}
+	}
+	return k
+}
+
+func splitNul(s string) []string {
+	var out []string
+	start := 0
+	for i, b := range s {
+		if b == 0 {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		out = append(out, s[start:])
+	}
+	return out
 }
 
 // Manager coordinates manifest writes, checkpoints, and segment indexing.

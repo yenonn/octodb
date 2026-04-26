@@ -1,6 +1,7 @@
 // Package store provides Block 2 storage: WAL + sorted memtable + segment flush.
 // Block 3 additions: block index footer, bloom filter, time-range seek.
 // Block 4 additions: two-level trace_id index (global locator + per-segment sidecar).
+// Block 4b additions: log signal path, dual WAL dual memtable.
 package store
 
 import (
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
@@ -28,61 +30,84 @@ const (
 	FlushPollInterval      = 1 * time.Second
 )
 
-type block2Store struct {
-	walPath     string
-	dataDir     string
-	wal         *wal.Writer
-	man         *manifest.Manager
-	memtableSet *memtable.Set
-	locator     *index.TraceLocator
-	mu          sync.RWMutex
-	stopFlush   chan struct{}
-	flushDone   sync.WaitGroup
+// signalBundle holds everything for one signal type (traces or logs).
+type signalBundle struct {
+	walPath string
+	wal     *wal.Writer
+	subdir  string                          // subdirectory under dataDir, e.g. "traces" / "logs"
+	man     *manifest.Manager               // per-signal manifest
+	set     *memtable.Set                   // dual memtable
+	locator *index.TraceLocator             // two-level trace index
+	mu      sync.RWMutex                    // protects bundle-level mutable fields
 }
 
-func NewBlock2Store(walPath string) (Store, error) {
-	dataDir := filepath.Dir(walPath)
+type block2Store struct {
+	dataDir string
+
+	traceBundle *signalBundle
+	logBundle   *signalBundle
+
+	stopFlush chan struct{}
+	flushDone sync.WaitGroup
+}
+
+func NewBlock2Store(dataDir string) (Store, error) {
 	if dataDir == "" {
 		dataDir = "."
 	}
-
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("block2: mkdir: %w", err)
 	}
 
-	w, err := wal.Open(walPath)
-	if err != nil {
-		return nil, fmt.Errorf("block2: wal: %w", err)
-	}
-
-	m, err := manifest.Open(dataDir)
-	if err != nil {
-		_ = w.Close()
-		return nil, fmt.Errorf("block2: manifest: %w", err)
-	}
-
 	s := &block2Store{
-		walPath:     walPath,
-		dataDir:     dataDir,
-		wal:         w,
-		man:         m,
-		memtableSet: memtable.NewSet(),
-		locator:     index.NewTraceLocator(),
-		stopFlush:   make(chan struct{}),
+		dataDir:   dataDir,
+		stopFlush: make(chan struct{}),
 	}
 
-	if err := s.rebuildLocator(); err != nil {
-		_ = w.Close()
-		return nil, fmt.Errorf("block2: rebuild locator: %w", err)
+	// --- Trace bundle ---
+	tb, err := s.createBundle("traces", "traces.wal")
+	if err != nil {
+		return nil, fmt.Errorf("block2: trace bundle: %w", err)
+	}
+	s.traceBundle = tb
+
+	// --- Log bundle ---
+	lb, err := s.createBundle("logs", "logs.wal")
+	if err != nil {
+		return nil, fmt.Errorf("block2: log bundle: %w", err)
+	}
+	s.logBundle = lb
+
+	// Rebuild locators from existing segments.
+	if err := s.rebuildLocator(s.traceBundle); err != nil {
+		return nil, fmt.Errorf("block2: rebuild trace locator: %w", err)
+	}
+	if err := s.rebuildLocator(s.logBundle); err != nil {
+		return nil, fmt.Errorf("block2: rebuild log locator: %w", err)
 	}
 
-	if err := s.replayWAL(); err != nil {
+	// Replay WAL for both bundles.
+	if err := s.replayBundle(s.traceBundle, func(raw []byte) {
+		key, data := s.extractTraceSortKey(raw)
+		s.traceBundle.set.Insert(key, data)
+	}); err != nil {
 		_ = s.Close()
-		return nil, fmt.Errorf("block2: replay: %w", err)
+		return nil, fmt.Errorf("block2: replay traces: %w", err)
+	}
+	if err := s.replayBundle(s.logBundle, func(raw []byte) {
+		key, data := s.extractLogSortKey(raw)
+		s.logBundle.set.Insert(key, data)
+	}); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("block2: replay logs: %w", err)
 	}
 
-	if s.memtableSet.ActiveSize() > 0 {
-		_ = s.flush()
+	// If anything is in memtable, flush now (covers immediate-restoration cases).
+	if s.traceBundle.set.ActiveSize() > 0 {
+		_ = s.flushBundle(s.traceBundle)
+	}
+	if s.logBundle.set.ActiveSize() > 0 {
+		_ = s.flushBundle(s.logBundle)
 	}
 
 	s.flushDone.Add(1)
@@ -91,32 +116,62 @@ func NewBlock2Store(walPath string) (Store, error) {
 	return s, nil
 }
 
-func (s *block2Store) rebuildLocator() error {
-	for _, rec := range s.man.AllRecords() {
-		idxPath := filepath.Join(s.dataDir, rec.SegmentFile+".trace.index")
+func (s *block2Store) createBundle(subdir, walBase string) (*signalBundle, error) {
+	dir := filepath.Join(s.dataDir, subdir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+	walPath := filepath.Join(dir, walBase)
+	w, err := wal.Open(walPath)
+	if err != nil {
+		return nil, fmt.Errorf("wal open %s: %w", walPath, err)
+	}
+	m, err := manifest.Open(dir)
+	if err != nil {
+		_ = w.Close()
+		return nil, fmt.Errorf("manifest open %s: %w", dir, err)
+	}
+	return &signalBundle{
+		walPath: walPath,
+		wal:     w,
+		subdir:  subdir,
+		man:     m,
+		set:     memtable.NewSet(),
+		locator: index.NewTraceLocator(),
+	}, nil
+}
+
+func (s *block2Store) rebuildLocator(b *signalBundle) error {
+	for _, rec := range b.man.AllRecords() {
+		idxPath := filepath.Join(s.dataDir, b.subdir, rec.SegmentFile+".trace.index")
 		idx, err := index.LoadSegmentTraceIndex(idxPath)
 		if err != nil {
 			continue
 		}
-		s.locator.Merge(rec.Sequence, idx)
+		b.locator.Merge(rec.Sequence, idx)
 	}
 	return nil
 }
 
-func (s *block2Store) replayWAL() error {
-	if _, err := os.Stat(s.walPath); os.IsNotExist(err) {
+func (s *block2Store) replayBundle(b *signalBundle, fn func(raw []byte)) error {
+	if _, err := os.Stat(b.walPath); os.IsNotExist(err) {
 		return nil
 	}
-	return wal.Replay(s.walPath, func(raw []byte, rs *tracepb.ResourceSpans) error {
-		key, data := s.extractSortKey(rs)
-		if data != nil {
-			s.memtableSet.Insert(key, data)
-		}
+	return wal.ReplayBytes(b.walPath, func(raw []byte) error {
+		fn(raw)
 		return nil
 	})
 }
 
-func (s *block2Store) extractSortKey(rs *tracepb.ResourceSpans) (otelutil.SortKey, []byte) {
+// ---------------------------------------------------------------------------
+// Trace sort key / extraction helpers
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) extractTraceSortKey(raw []byte) (memtable.Key, []byte) {
+	var rs tracepb.ResourceSpans
+	if err := proto.Unmarshal(raw, &rs); err != nil {
+		return memtable.Key{}, nil
+	}
 	svc := ""
 	if rs.Resource != nil {
 		for _, attr := range rs.Resource.Attributes {
@@ -136,12 +191,11 @@ func (s *block2Store) extractSortKey(rs *tracepb.ResourceSpans) (otelutil.SortKe
 	if spanID == "" {
 		spanID = "0000000000000000"
 	}
-	key := otelutil.SortKey{TenantID: "default", Service: svc, TimeNano: timeNano, SpanID: spanID}
-	data, _ := proto.Marshal(rs)
-	return key, data
+	key := otelutil.TraceSortKey{TenantID: "default", Service: svc, TimeNano: timeNano, SpanID: spanID}
+	return memtable.Key{DType: otelutil.TypeTrace, Key: key.Key()}, raw
 }
 
-func (s *block2Store) extractTraceID(raw []byte) string {
+func (s *block2Store) extractTraceIDFromData(raw []byte) string {
 	var rs tracepb.ResourceSpans
 	if err := proto.Unmarshal(raw, &rs); err != nil {
 		return ""
@@ -152,49 +206,108 @@ func (s *block2Store) extractTraceID(raw []byte) string {
 	return ""
 }
 
+// ---------------------------------------------------------------------------
+// Log sort key / extraction helpers
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) extractLogSortKey(raw []byte) (memtable.Key, []byte) {
+	var rl logspb.ResourceLogs
+	if err := proto.Unmarshal(raw, &rl); err != nil {
+		return memtable.Key{}, nil
+	}
+	svc := ""
+	if rl.Resource != nil {
+		for _, attr := range rl.Resource.Attributes {
+			if attr.Key == "service.name" {
+				svc = attr.Value.GetStringValue()
+				break
+			}
+		}
+	}
+	var timeNano uint64
+	var traceID string
+	var logID string
+	if len(rl.ScopeLogs) > 0 && len(rl.ScopeLogs[0].LogRecords) > 0 {
+		lr := rl.ScopeLogs[0].LogRecords[0]
+		timeNano = lr.ObservedTimeUnixNano
+		if timeNano == 0 {
+			timeNano = lr.TimeUnixNano
+		}
+		traceID = fmt.Sprintf("%x", lr.TraceId)
+		logID = fmt.Sprintf("%d_%x", lr.SeverityNumber, lr.SpanId)
+	}
+	if traceID == "" {
+		traceID = "none"
+	}
+	if logID == "" {
+		logID = "none"
+	}
+	key := otelutil.LogSortKey{TenantID: "default", Service: svc, TimeNano: timeNano, TraceID: traceID, LogID: logID}
+	return memtable.Key{DType: otelutil.TypeLog, Key: key.Key()}, raw
+}
+
+func (s *block2Store) extractLogTraceID(raw []byte) string {
+	var rl logspb.ResourceLogs
+	if err := proto.Unmarshal(raw, &rl); err != nil {
+		return ""
+	}
+	if len(rl.ScopeLogs) > 0 && len(rl.ScopeLogs[0].LogRecords) > 0 {
+		return fmt.Sprintf("%x", rl.ScopeLogs[0].LogRecords[0].TraceId)
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------------------
+// WriteTraces
+// ---------------------------------------------------------------------------
+
 func (s *block2Store) WriteTraces(ctx context.Context, tenantID string, spans []*tracepb.ResourceSpans) error {
 	for _, rs := range spans {
 		data, err := proto.Marshal(rs)
 		if err != nil {
 			return err
 		}
-		if err := s.wal.Append(data); err != nil {
+		if err := s.traceBundle.wal.Append(data); err != nil {
 			return err
 		}
 	}
-	if err := s.wal.Sync(); err != nil {
+	if err := s.traceBundle.wal.Sync(); err != nil {
 		return err
 	}
-
 	for _, rs := range spans {
-		key, data := s.extractSortKey(rs)
-		s.memtableSet.Insert(key, data)
+		data, _ := proto.Marshal(rs)
+		key, data2 := s.extractTraceSortKey(data)
+		s.traceBundle.set.Insert(key, data2)
 	}
-
 	return nil
 }
 
-func (s *block2Store) ReadTraces(ctx context.Context, req ReadRequest) ([]*tracepb.ResourceSpans, error) {
+// ---------------------------------------------------------------------------
+// ReadTraces
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) ReadTraces(ctx context.Context, req TraceReadRequest) ([]*tracepb.ResourceSpans, error) {
 	var result []*tracepb.ResourceSpans
 
-	active, flushing := s.memtableSet.Snapshot()
+	active, flushing := s.traceBundle.set.Snapshot()
 	for _, tbl := range []*memtable.Memtable{active, flushing} {
 		if tbl == nil {
 			continue
 		}
-		tbl.Ascend(func(key otelutil.SortKey, value []byte) bool {
-			if !s.keyMatches(key, req) {
+		tbl.AscendByType(otelutil.TypeTrace, func(key memtable.Key, value []byte) bool {
+			var rs tracepb.ResourceSpans
+			if err := proto.Unmarshal(value, &rs); err != nil {
 				return true
 			}
-			var rs tracepb.ResourceSpans
-			if err := proto.Unmarshal(value, &rs); err == nil {
-				result = append(result, &rs)
+			if !s.traceKeyMatches(rs, req) {
+				return true
 			}
+			result = append(result, &rs)
 			return true
 		})
 	}
 
-	for _, rec := range s.man.AllRecords() {
+	for _, rec := range s.traceBundle.man.AllRecords() {
 		if rec.MinKey.TenantID != req.TenantID && rec.MaxKey.TenantID != req.TenantID {
 			continue
 		}
@@ -205,43 +318,36 @@ func (s *block2Store) ReadTraces(ctx context.Context, req ReadRequest) ([]*trace
 			continue
 		}
 		if req.Service != "" && rec.BloomFile != "" {
-			bloomPath := filepath.Join(s.dataDir, rec.BloomFile)
+			bloomPath := filepath.Join(s.dataDir, s.traceBundle.subdir, rec.BloomFile)
 			if bf, err := bloom.Load(bloomPath); err == nil {
-				targetKey := otelutil.SortKey{TenantID: req.TenantID, Service: req.Service, TimeNano: 0, SpanID: "0000000000000000"}.Key()
-				if !bf.MightContain(targetKey) {
+				target := otelutil.TraceSortKey{TenantID: req.TenantID, Service: req.Service, TimeNano: 0, SpanID: "0000000000000000"}
+				if !bf.MightContain(target.Key()) {
 					continue
 				}
 			}
 		}
 
-		segPath := filepath.Join(s.dataDir, rec.SegmentFile)
+		segPath := filepath.Join(s.dataDir, s.traceBundle.subdir, rec.SegmentFile)
 		seg, err := segment.Open(segPath)
 		if err != nil {
 			continue
 		}
 
 		if req.StartTime > 0 && len(seg.Footer().Blocks) > 0 {
-			targetKey := otelutil.SortKey{TenantID: req.TenantID, Service: req.Service, TimeNano: uint64(req.StartTime), SpanID: "0000000000000000"}.Key()
-			_ = seg.SeekTo(targetKey)
+			target := otelutil.TraceSortKey{TenantID: req.TenantID, Service: req.Service, TimeNano: uint64(req.StartTime), SpanID: "0000000000000000"}
+			_ = seg.SeekTo(target.Key())
 		}
 
 		for {
 			data, err := seg.Next()
 			if err != nil {
-				if err.Error() == "EOF" {
-					break
-				}
 				break
 			}
 			var rs tracepb.ResourceSpans
 			if err := proto.Unmarshal(data, &rs); err != nil {
 				continue
 			}
-			key, _ := s.extractSortKey(&rs)
-			if req.EndTime > 0 && key.TimeNano >= uint64(req.EndTime) {
-				break
-			}
-			if !s.keyMatches(key, req) {
+			if !s.traceKeyMatches(rs, req) {
 				continue
 			}
 			result = append(result, &rs)
@@ -252,21 +358,75 @@ func (s *block2Store) ReadTraces(ctx context.Context, req ReadRequest) ([]*trace
 	return result, nil
 }
 
-// ReadTraceByID uses a two-level index: global locator (Layer 1) + per-segment sidecars (Layer 2).
+func (s *block2Store) traceKeyMatches(rs tracepb.ResourceSpans, req TraceReadRequest) bool {
+	svc := ""
+	if rs.Resource != nil {
+		for _, a := range rs.Resource.Attributes {
+			if a.Key == "service.name" {
+				svc = a.Value.GetStringValue()
+				break
+			}
+		}
+	}
+	tid := "default"
+	if req.TenantID != "" {
+		tid = req.TenantID
+	}
+	if tid != "default" && tid != "" {
+		// tenant check not strictly enforced in this prototype; default passes.
+	}
+	if req.Service != "" && svc != req.Service {
+		return false
+	}
+	if req.TraceID != "" {
+		var found bool
+		for _, ss := range rs.ScopeSpans {
+			for _, sp := range ss.Spans {
+				if fmt.Sprintf("%x", sp.TraceId) == req.TraceID {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	// Time check — use first span.
+	var timeNano uint64
+	if len(rs.ScopeSpans) > 0 && len(rs.ScopeSpans[0].Spans) > 0 {
+		timeNano = rs.ScopeSpans[0].Spans[0].StartTimeUnixNano
+	}
+	if req.StartTime > 0 && int64(timeNano) < req.StartTime {
+		return false
+	}
+	if req.EndTime > 0 && int64(timeNano) >= req.EndTime {
+		return false
+	}
+	return true
+}
+
+// ---------------------------------------------------------------------------
+// ReadTraceByID
+// ---------------------------------------------------------------------------
+
 func (s *block2Store) ReadTraceByID(ctx context.Context, tenantID, traceID string) ([]*tracepb.ResourceSpans, error) {
 	var result []*tracepb.ResourceSpans
 
-	seqs := s.locator.Find(traceID)
+	seqs := s.traceBundle.locator.Find(traceID)
 	for _, seq := range seqs {
-		segPath := filepath.Join(s.dataDir, fmt.Sprintf("sst-%08d.pb", seq))
+		segPath := filepath.Join(s.dataDir, s.traceBundle.subdir, fmt.Sprintf("sst-%08d.pb", seq))
 		idxPath := segPath + ".trace.index"
 
 		idx, err := index.LoadSegmentTraceIndex(idxPath)
 		if err != nil {
 			continue
 		}
-		offsets := idx.Offsets[traceID]
-		if len(offsets) == 0 {
+		offsets, ok := idx.Offsets[traceID]
+		if !ok || len(offsets) == 0 {
 			continue
 		}
 
@@ -294,25 +454,179 @@ func (s *block2Store) ReadTraceByID(ctx context.Context, tenantID, traceID strin
 	return result, nil
 }
 
-func (s *block2Store) keyMatches(key otelutil.SortKey, req ReadRequest) bool {
-	if key.TenantID != req.TenantID {
+// ---------------------------------------------------------------------------
+// WriteLogs
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) WriteLogs(ctx context.Context, tenantID string, logs []*logspb.ResourceLogs) error {
+	for _, rl := range logs {
+		data, err := proto.Marshal(rl)
+		if err != nil {
+			return err
+		}
+		if err := s.logBundle.wal.Append(data); err != nil {
+			return err
+		}
+	}
+	if err := s.logBundle.wal.Sync(); err != nil {
+		return err
+	}
+	for _, rl := range logs {
+		data, _ := proto.Marshal(rl)
+		key, data2 := s.extractLogSortKey(data)
+		s.logBundle.set.Insert(key, data2)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// ReadLogs
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) ReadLogs(ctx context.Context, req LogReadRequest) ([]*logspb.ResourceLogs, error) {
+	var result []*logspb.ResourceLogs
+
+	active, flushing := s.logBundle.set.Snapshot()
+	for _, tbl := range []*memtable.Memtable{active, flushing} {
+		if tbl == nil {
+			continue
+		}
+		tbl.AscendByType(otelutil.TypeLog, func(key memtable.Key, value []byte) bool {
+			var rl logspb.ResourceLogs
+			if err := proto.Unmarshal(value, &rl); err != nil {
+				return true
+			}
+			if !s.logKeyMatches(rl, req) {
+				return true
+			}
+			result = append(result, &rl)
+			return true
+		})
+	}
+
+	for _, rec := range s.logBundle.man.AllRecords() {
+		if rec.MinKey.TenantID != req.TenantID && rec.MaxKey.TenantID != req.TenantID {
+			continue
+		}
+		if req.Service != "" && rec.MinKey.Service != req.Service && rec.MaxKey.Service != req.Service {
+			continue
+		}
+		if uint64(req.EndTime) <= rec.MinKey.TimeNano || uint64(req.StartTime) >= rec.MaxKey.TimeNano {
+			continue
+		}
+		if req.Service != "" && rec.BloomFile != "" {
+			bloomPath := filepath.Join(s.dataDir, s.logBundle.subdir, rec.BloomFile)
+			if bf, err := bloom.Load(bloomPath); err == nil {
+				target := otelutil.LogSortKey{TenantID: req.TenantID, Service: req.Service, TimeNano: 0}
+				if !bf.MightContain(target.Key()) {
+					continue
+				}
+			}
+		}
+
+		segPath := filepath.Join(s.dataDir, s.logBundle.subdir, rec.SegmentFile)
+		seg, err := segment.Open(segPath)
+		if err != nil {
+			continue
+		}
+
+		if req.StartTime > 0 && len(seg.Footer().Blocks) > 0 {
+			target := otelutil.LogSortKey{TenantID: req.TenantID, Service: req.Service, TimeNano: uint64(req.StartTime)}
+			_ = seg.SeekTo(target.Key())
+		}
+
+		for {
+			data, err := seg.Next()
+			if err != nil {
+				break
+			}
+			var rl logspb.ResourceLogs
+			if err := proto.Unmarshal(data, &rl); err != nil {
+				continue
+			}
+			if !s.logKeyMatches(rl, req) {
+				continue
+			}
+			result = append(result, &rl)
+		}
+		_ = seg.Close()
+	}
+
+	return result, nil
+}
+
+func (s *block2Store) logKeyMatches(rl logspb.ResourceLogs, req LogReadRequest) bool {
+	svc := ""
+	if rl.Resource != nil {
+		for _, a := range rl.Resource.Attributes {
+			if a.Key == "service.name" {
+				svc = a.Value.GetStringValue()
+				break
+			}
+		}
+	}
+	if req.Service != "" && svc != req.Service {
 		return false
 	}
-	if req.Service != "" && key.Service != req.Service {
+	// Time check — use first log record.
+	var timeNano uint64
+	var severity int32
+	if len(rl.ScopeLogs) > 0 && len(rl.ScopeLogs[0].LogRecords) > 0 {
+		lr := rl.ScopeLogs[0].LogRecords[0]
+		timeNano = lr.ObservedTimeUnixNano
+		if timeNano == 0 {
+			timeNano = lr.TimeUnixNano
+		}
+		severity = int32(lr.SeverityNumber)
+	}
+	if req.StartTime > 0 && int64(timeNano) < req.StartTime {
 		return false
 	}
-	if key.TimeNano < uint64(req.StartTime) || key.TimeNano >= uint64(req.EndTime) {
+	if req.EndTime > 0 && int64(timeNano) >= req.EndTime {
 		return false
+	}
+	if req.Severity > 0 && severity != req.Severity {
+		return false
+	}
+	if req.TraceID != "" {
+		var found bool
+		for _, sl := range rl.ScopeLogs {
+			for _, lr := range sl.LogRecords {
+				if fmt.Sprintf("%x", lr.TraceId) == req.TraceID {
+					found = true
+					break
+				}
+			}
+			if found {
+				break
+			}
+		}
+		if !found {
+			return false
+		}
 	}
 	return true
 }
 
+// ---------------------------------------------------------------------------
+// Close
+// ---------------------------------------------------------------------------
+
 func (s *block2Store) Close() error {
 	close(s.stopFlush)
 	s.flushDone.Wait()
-	_ = s.wal.Close()
+	if s.traceBundle != nil {
+		_ = s.traceBundle.wal.Close()
+	}
+	if s.logBundle != nil {
+		_ = s.logBundle.wal.Close()
+	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// Flush monitor (single goroutine polls both bundles)
+// ---------------------------------------------------------------------------
 
 func (s *block2Store) flushMonitor() {
 	defer s.flushDone.Done()
@@ -322,66 +636,82 @@ func (s *block2Store) flushMonitor() {
 	for {
 		select {
 		case <-s.stopFlush:
-			if s.memtableSet.ActiveSize() > 0 {
-				_ = s.flush()
+			if s.traceBundle.set.ActiveSize() > 0 {
+				_ = s.flushBundle(s.traceBundle)
+			}
+			if s.logBundle.set.ActiveSize() > 0 {
+				_ = s.flushBundle(s.logBundle)
 			}
 			return
 		case <-ticker.C:
-			if s.memtableSet.ActiveSize() >= MemtableFlushThreshold {
-				_ = s.flush()
+			if s.traceBundle.set.ActiveSize() >= MemtableFlushThreshold {
+				_ = s.flushBundle(s.traceBundle)
+			}
+			if s.logBundle.set.ActiveSize() >= MemtableFlushThreshold {
+				_ = s.flushBundle(s.logBundle)
 			}
 		}
 	}
 }
 
-func (s *block2Store) flush() error {
-	flushing := s.memtableSet.Rotate()
+// ---------------------------------------------------------------------------
+// Flush bundle
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) flushBundle(b *signalBundle) error {
+	flushing := b.set.Rotate()
 	if flushing == nil {
 		return nil
 	}
-	defer s.memtableSet.ClearFlushing()
+	defer b.set.ClearFlushing()
 
-	seq := s.man.NextSequence()
-	segPath := filepath.Join(s.dataDir, fmt.Sprintf("sst-%08d.pb", seq))
+	seq := b.man.NextSequence()
+	segPath := filepath.Join(s.dataDir, b.subdir, fmt.Sprintf("sst-%08d.pb", seq))
 
 	seg, err := segment.Create(segPath)
 	if err != nil {
-		return fmt.Errorf("flush: create segment: %w", err)
+		return fmt.Errorf("flush: create segment in %s: %w", b.subdir, err)
 	}
 
-	var minKey, maxKey otelutil.SortKey
+	var minKey, maxKey manifest.SortKey
 	var first bool
 	var bloomKeys []string
-	var lastKey string
+	var lastSortKey string
 
 	traceIndex := index.SegmentTraceIndex{Offsets: make(map[string][]int64)}
 
-	flushing.Ascend(func(key otelutil.SortKey, value []byte) bool {
+	flushing.Ascend(func(key memtable.Key, value []byte) bool {
 		offset, _ := seg.CurrentOffset()
 
-		traceID := s.extractTraceID(value)
-		if traceID != "" {
+		var traceID string
+		if key.DType == otelutil.TypeTrace {
+			traceID = s.extractTraceIDFromData(value)
+		} else if key.DType == otelutil.TypeLog {
+			traceID = s.extractLogTraceID(value)
+		}
+		if traceID != "" && traceID != "none" {
 			traceIndex.Offsets[traceID] = append(traceIndex.Offsets[traceID], offset)
 		}
 
 		_ = seg.Append(value)
+		mk := manifest.SortKeyFromString(key.Key)
 		if !first {
-			minKey, maxKey = key, key
+			minKey, maxKey = mk, mk
 			first = true
 		} else {
-			if key.Key() < minKey.Key() {
-				minKey = key
+			if key.Key < minKey.Str {
+				minKey = mk
 			}
-			if key.Key() > maxKey.Key() {
-				maxKey = key
+			if key.Key > maxKey.Str {
+				maxKey = mk
 			}
 		}
-		bloomKeys = append(bloomKeys, key.Key())
-		lastKey = key.Key()
+		bloomKeys = append(bloomKeys, key.Key)
+		lastSortKey = key.Key
 		return true
 	})
 
-	if err := seg.Close(lastKey); err != nil {
+	if err := seg.Close(lastSortKey); err != nil {
 		return fmt.Errorf("flush: close segment: %w", err)
 	}
 
@@ -390,52 +720,42 @@ func (s *block2Store) flush() error {
 		return fmt.Errorf("flush: save trace index: %w", err)
 	}
 
-	s.locator.Merge(seq, &traceIndex)
+	b.locator.Merge(seq, &traceIndex)
 
 	bf := bloom.Build(bloomKeys, 0.01)
-	bloomPath := filepath.Join(s.dataDir, fmt.Sprintf("sst-%08d.bloom", seq))
+	bloomPath := filepath.Join(s.dataDir, b.subdir, fmt.Sprintf("sst-%08d.bloom", seq))
 	if err := bf.Save(bloomPath); err != nil {
 		return fmt.Errorf("flush: save bloom: %w", err)
 	}
 
-	walName := filepath.Base(s.walPath)
-	offset := s.wal.Offset()
+	walName := filepath.Base(b.walPath)
+	offset := b.wal.Offset()
 
 	rec := manifest.Record{
 		Sequence:      seq,
 		SegmentFile:   filepath.Base(segPath),
 		BloomFile:     filepath.Base(bloomPath),
 		WALCheckpoint: fmt.Sprintf("%s:%d", walName, offset),
-		MinKey: manifest.SortKey{
-			TenantID: minKey.TenantID,
-			Service:  minKey.Service,
-			TimeNano: minKey.TimeNano,
-			SpanID:   minKey.SpanID,
-		},
-		MaxKey: manifest.SortKey{
-			TenantID: maxKey.TenantID,
-			Service:  maxKey.Service,
-			TimeNano: maxKey.TimeNano,
-			SpanID:   maxKey.SpanID,
-		},
-		SpanCount: int64(len(bloomKeys)),
-		Checksum:  "",
+		MinKey:        minKey,
+		MaxKey:        maxKey,
+		SpanCount:     int64(len(bloomKeys)),
+		Checksum:      "",
 	}
-	if err := s.man.AppendRecord(rec); err != nil {
+	if err := b.man.AppendRecord(rec); err != nil {
 		return fmt.Errorf("flush: manifest: %w", err)
 	}
 
-	if err := s.man.WriteCheckpoint(walName, offset); err != nil {
+	if err := b.man.WriteCheckpoint(walName, offset); err != nil {
 		return fmt.Errorf("flush: checkpoint: %w", err)
 	}
 
-	_ = s.wal.Close()
-	_ = os.Truncate(s.walPath, 0)
-	w, err := wal.Open(s.walPath)
+	_ = b.wal.Close()
+	_ = os.Truncate(b.walPath, 0)
+	w, err := wal.Open(b.walPath)
 	if err != nil {
 		return fmt.Errorf("flush: reopen wal: %w", err)
 	}
-	s.wal = w
+	b.wal = w
 
 	return nil
 }

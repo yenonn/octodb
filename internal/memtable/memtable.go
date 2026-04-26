@@ -1,32 +1,43 @@
-// Package memtable provides a sorted in-memory structure for hot trace data.
+// Package memtable provides sorted in-memory structures for hot trace and log data.
 //
 // Block 2: B-tree memtable with dual rotation (active + immutable for flush).
-// Sort key: (tenant_id, service.name, start_time_unix_nano, span_id).
+// Sort key: (data_type, tenant_id, service.name, time, id).
+//
+// Block 4+: Added log support via dual signal path.
 package memtable
 
 import (
 	"sync"
 
 	"github.com/google/btree"
-
 	"github.com/octodb/octodb/pkg/otelutil"
 )
 
+// Key is the unified sort key used in the memtable.
+type Key struct {
+	DType otelutil.DataType // "trace" or "log"
+	Key   string            // full sort key string
+}
+
 // Item is a single entry in the memtable.
 type Item struct {
-	Key   otelutil.SortKey
+	Key   Key
 	Value []byte // raw proto bytes
 }
 
 func (i Item) Less(than btree.Item) bool {
-	return i.Key.Key() < than.(Item).Key.Key()
+	j := than.(Item)
+	if i.Key.DType != j.Key.DType {
+		return i.Key.DType < j.Key.DType
+	}
+	return i.Key.Key < j.Key.Key
 }
 
 // Memtable is a sorted in-memory buffer backed by a B-tree.
 type Memtable struct {
-	data  *btree.BTree
-	size  int64 // estimated bytes
-	mu    sync.RWMutex
+	data *btree.BTree
+	size int64 // estimated bytes
+	mu   sync.RWMutex
 }
 
 // New creates an empty memtable.
@@ -37,9 +48,9 @@ func New() *Memtable {
 }
 
 // Insert adds an item. Not safe for concurrent use without caller locking.
-func (m *Memtable) Insert(key otelutil.SortKey, value []byte) {
+func (m *Memtable) Insert(key Key, value []byte) {
 	m.data.ReplaceOrInsert(Item{Key: key, Value: value})
-	m.size += int64(len(key.Key()) + len(value))
+	m.size += int64(len(key.Key) + len(value))
 }
 
 // Size returns estimated bytes held by the memtable.
@@ -58,11 +69,30 @@ func (m *Memtable) SetSize(n int64) {
 
 // Ascend calls fn for every item in ascending sort key order.
 // Safe for concurrent reads.
-func (m *Memtable) Ascend(fn func(key otelutil.SortKey, value []byte) bool) {
+func (m *Memtable) Ascend(fn func(key Key, value []byte) bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	m.data.Ascend(func(item btree.Item) bool {
 		it := item.(Item)
+		return fn(it.Key, it.Value)
+	})
+}
+
+// AscendByType calls fn only for items matching the given data type.
+func (m *Memtable) AscendByType(dtype otelutil.DataType, fn func(key Key, value []byte) bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	m.data.Ascend(func(item btree.Item) bool {
+		it := item.(Item)
+		if it.Key.DType != dtype {
+			// Since the B-tree is sorted by DType first, if we've passed the target,
+			// we can stop (if dtype < current, keep going until we reach it;
+			// if dtype > current, we've gone past)
+			if it.Key.DType > dtype {
+				return false
+			}
+			return true
+		}
 		return fn(it.Key, it.Value)
 	})
 }
@@ -84,7 +114,7 @@ func NewSet() *Set {
 }
 
 // Insert writes an item into the active memtable.
-func (s *Set) Insert(key otelutil.SortKey, value []byte) {
+func (s *Set) Insert(key Key, value []byte) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	s.active.Insert(key, value)
@@ -104,7 +134,6 @@ func (s *Set) Rotate() *Memtable {
 	defer s.mu.Unlock()
 
 	if s.flushing != nil {
-		// Already rotating — caller should wait.
 		return nil
 	}
 	immutable := s.active

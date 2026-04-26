@@ -26,8 +26,13 @@ func main() {
 		log.Fatalf("failed to load config: %v", err)
 	}
 
+	dataDir := os.Getenv("OCTODB_DATA_DIR")
+	if dataDir == "" {
+		dataDir = "octodb-data"
+	}
+
 	// Block 2: Use Block2Store (WAL + memtable + flush)
-	st, err := store.NewBlock2Store(cfg.WAL.Path)
+	st, err := store.NewBlock2Store(dataDir)
 	if err != nil {
 		log.Fatalf("failed to open Block 2 store: %v", err)
 	}
@@ -39,29 +44,30 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
-	ts := server.NewTraceServer(st)
-	server.Register(grpcServer, ts)
+	server.RegisterAll(grpcServer, st)
 
 	go func() {
-		log.Printf("OctoDB Block 2 starting — gRPC on %s | WAL at %s", cfg.Server.GRPCAddr, cfg.WAL.Path)
+		log.Printf("OctoDB starting — gRPC on %s | data at octodb-data", cfg.Server.GRPCAddr)
 		if err := grpcServer.Serve(lis); err != nil {
 			log.Fatalf("failed to serve grpc: %v", err)
 		}
 	}()
 
-	// HTTP query server (Block 2)
+	// HTTP query server
 	go func() {
 		mux := http.NewServeMux()
+
+		// --- Traces ---
 		mux.HandleFunc("/v1/traces", func(w http.ResponseWriter, r *http.Request) {
 			tenantID := r.URL.Query().Get("tenant")
 			if tenantID == "" {
 				tenantID = "default"
 			}
-			req := store.ReadRequest{
+			req := store.TraceReadRequest{
 				TenantID:  tenantID,
 				Service:   r.URL.Query().Get("service"),
 				StartTime: 0,
-				EndTime: 1<<63 - 1,
+				EndTime:   1<<63 - 1,
 			}
 			spans, err := st.ReadTraces(r.Context(), req)
 			if err != nil {
@@ -70,16 +76,62 @@ func main() {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]any{
-				"count": len(spans),
+				"count":  len(spans),
 				"tenant": tenantID,
 			})
 		})
+		mux.HandleFunc("/v1/traces/", func(w http.ResponseWriter, r *http.Request) {
+			tenantID := r.URL.Query().Get("tenant")
+			if tenantID == "" {
+				tenantID = "default"
+			}
+			traceID := r.URL.Path[len("/v1/traces/"):]
+			if traceID == "" {
+				http.Error(w, "missing trace_id", http.StatusBadRequest)
+				return
+			}
+			spans, err := st.ReadTraceByID(r.Context(), tenantID, traceID)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"trace_id": traceID,
+				"count":    len(spans),
+			})
+		})
+
+		// --- Logs ---
+		mux.HandleFunc("/v1/logs", func(w http.ResponseWriter, r *http.Request) {
+			tenantID := r.URL.Query().Get("tenant")
+			if tenantID == "" {
+				tenantID = "default"
+			}
+			req := store.LogReadRequest{
+				TenantID:  tenantID,
+				Service:   r.URL.Query().Get("service"),
+				StartTime: 0,
+				EndTime:   1<<63 - 1,
+			}
+			logs, err := st.ReadLogs(r.Context(), req)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"count":  len(logs),
+				"tenant": tenantID,
+			})
+		})
+
 		addr := cfg.Server.GRPCAddr
 		if addr[0] == ':' {
 			addr = "localhost" + addr
 		}
 		httpPort := ":8080"
-		log.Printf("OctoDB Block 2 query API on %s", httpPort)
+		log.Printf("OctoDB query API on %s", httpPort)
 		log.Fatal(http.ListenAndServe(httpPort, mux))
 	}()
 

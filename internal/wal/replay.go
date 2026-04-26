@@ -2,6 +2,7 @@ package wal
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 
@@ -26,10 +27,21 @@ type Record struct {
 //	    return nil
 //	})
 func Replay(path string, fn func(raw []byte, rs *tracepb.ResourceSpans) error) error {
+	return ReplayBytes(path, func(raw []byte) error {
+		var rs tracepb.ResourceSpans
+		if err := proto.Unmarshal(raw, &rs); err != nil {
+			return err
+		}
+		return fn(raw, &rs)
+	})
+}
+
+// ReplayBytes replays raw WAL bytes without forcing a protobuf type.
+// Used for log signal path where the signal type is determined at runtime.
+func ReplayBytes(path string, fn func(raw []byte) error) error {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// Empty WAL is valid — nothing to replay.
 			return nil
 		}
 		return err
@@ -37,7 +49,6 @@ func Replay(path string, fn func(raw []byte, rs *tracepb.ResourceSpans) error) e
 	defer f.Close()
 
 	r := NewReader(f)
-
 	for {
 		data, err := r.Next()
 		if err == io.EOF {
@@ -46,13 +57,7 @@ func Replay(path string, fn func(raw []byte, rs *tracepb.ResourceSpans) error) e
 		if err != nil {
 			return err
 		}
-
-		var rs tracepb.ResourceSpans
-		if err := proto.Unmarshal(data, &rs); err != nil {
-			return err
-		}
-
-		if err := fn(data, &rs); err != nil {
+		if err := fn(data); err != nil {
 			return err
 		}
 	}
@@ -70,11 +75,77 @@ func ReplayToSlice(path string) ([]*tracepb.ResourceSpans, error) {
 	return result, err
 }
 
+// ReplayToRawSlice replays WAL into raw byte slices (type-agnostic).
+func ReplayToRawSlice(path string) ([][]byte, error) {
+	var result [][]byte
+	err := ReplayBytes(path, func(raw []byte) error {
+		result = append(result, raw)
+		return nil
+	})
+	return result, err
+}
+
 // TODO(gate-0): Replay from a specific offset (requires manifest checkpoint).
 // For Block 1, replay always starts at offset 0.
 func ReplayFromOffset(ctx context.Context, path string, offset int64, fn func(raw []byte, rs *tracepb.ResourceSpans) error) error {
 	// TBD when manifest checkpointing is implemented in Block 2.
-	_ = ctx
 	_ = offset
 	return Replay(path, fn)
+}
+
+// ---------------------------------------------------------------------------
+// WAL crash-recovery helpers
+// ---------------------------------------------------------------------------
+
+// Checkpoint writes a "done" marker at the end of WAL so replay knows where to stop.
+// For now, returns the current offset as the logical checkpoint.
+func (w *Writer) Checkpoint() (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.offset, w.file.Sync()
+}
+
+// ReplayAndCheckpoint replays up to the last fsynced offset (current file size).
+func ReplayAndCheckpoint(path string, fn func(raw []byte, rs *tracepb.ResourceSpans) error) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if info.Size() == 0 {
+		return nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	r := NewReader(f)
+	var count int
+	for {
+		data, err := r.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			// Truncated WAL at the write boundary — fsync may not have completed.
+			// Skip the last partial record (best-effort).
+			fmt.Fprintf(os.Stderr, "wal checkpoint: skipping truncated record at count=%d: %v\n", count, err)
+			return nil
+		}
+		count++
+		var rs tracepb.ResourceSpans
+		if err := proto.Unmarshal(data, &rs); err != nil {
+			// Corrupt record — skip and keep recovering.
+			continue
+		}
+		if err := fn(data, &rs); err != nil {
+			return err
+		}
+	}
+	return nil
 }

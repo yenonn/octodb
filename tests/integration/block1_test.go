@@ -14,8 +14,10 @@ import (
 	"testing"
 	"time"
 
+	collectorlogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 	"google.golang.org/grpc"
@@ -51,12 +53,9 @@ func startServer(tb testing.TB, bin string, dataDir string) *exec.Cmd {
 	tb.Helper()
 	cmd := exec.Command(bin, "-config", "none")
 	cmd.Env = append(os.Environ(),
-		"OCTODB_WAL_PATH="+filepath.Join(dataDir, "octodb.wal"),
-		"OCTODB_GRPC_ADDR=:0", // random port — but we need to know it!
+		"OCTODB_GRPC_ADDR=:4317",
+		"OCTODB_DATA_DIR="+dataDir,
 	)
-	// We'll use a fixed port to keep the test simple.
-	// In production we'd parse the actual bound port from stdout.
-	cmd.Env = append(cmd.Env, "OCTODB_GRPC_ADDR=:4317")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -74,7 +73,6 @@ func TestBlock1_WALCrashRecovery(t *testing.T) {
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	walPath := filepath.Join(dataDir, "octodb.wal")
 
 	// --- Step 1: Start OctoDB ---
 	cmd := startServer(t, bin, dataDir)
@@ -84,12 +82,13 @@ func TestBlock1_WALCrashRecovery(t *testing.T) {
 			_ = cmd.Wait()
 		}
 	}()
-	time.Sleep(1 * time.Second) // wait for gRPC up
+	time.Sleep(1 * time.Second)
 
 	// --- Step 2: Send OTLP Export ---
 	sendExport(t, dataDir, buildTestResourceSpans("integration-test-svc", "test-span"))
 
 	// --- Step 3: Verify WAL has bytes ---
+	walPath := filepath.Join(dataDir, "traces", "traces.wal")
 	info, err := os.Stat(walPath)
 	if err != nil {
 		t.Fatalf("wal stat: %v", err)
@@ -126,8 +125,6 @@ func TestBlock1_WALCrashRecovery(t *testing.T) {
 
 	expected := buildTestResourceSpans("integration-test-svc", "test-span")
 
-	// Compare key fields (not full proto.Equal — internal protobuf state may differ
-	// after gRPC round-trip, e.g. nil vs empty slices.)
 	if expected.Resource.Attributes[0].Value.GetStringValue() !=
 		replayed[0].Resource.Attributes[0].Value.GetStringValue() {
 		t.Fatal("replayed service.name does not match")
@@ -150,8 +147,6 @@ func TestBlock1_WALCrashRecovery(t *testing.T) {
 // sendExport connects to the running server and sends one ResourceSpans batch.
 func sendExport(t *testing.T, dataDir string, rs *tracepb.ResourceSpans) {
 	t.Helper()
-
-	// Use a short retry loop in case server isn't fully up.
 	var conn *grpc.ClientConn
 	var err error
 	for i := 0; i < 10; i++ {
@@ -176,6 +171,36 @@ func sendExport(t *testing.T, dataDir string, rs *tracepb.ResourceSpans) {
 	defer cancel()
 	if _, err := client.Export(ctx, req); err != nil {
 		t.Fatalf("export: %v", err)
+	}
+}
+
+// sendLogExport sends one ResourceLogs batch to the server.
+func sendLogExport(t *testing.T, dataDir string, rl *logspb.ResourceLogs) {
+	t.Helper()
+	var conn *grpc.ClientConn
+	var err error
+	for i := 0; i < 10; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		conn, err = grpc.DialContext(ctx, "localhost:4317", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+		cancel()
+		if err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer conn.Close()
+
+	client := collectorlogs.NewLogsServiceClient(conn)
+	req := &collectorlogs.ExportLogsServiceRequest{
+		ResourceLogs: []*logspb.ResourceLogs{rl},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := client.Export(ctx, req); err != nil {
+		t.Fatalf("log export: %v", err)
 	}
 }
 
@@ -215,6 +240,36 @@ func buildTestResourceSpans(svc, spanName string) *tracepb.ResourceSpans {
 	}
 }
 
+// buildTestResourceLogs creates a minimal ResourceLogs proto for tests.
+func buildTestResourceLogs(svc, body string, severity logspb.SeverityNumber) *logspb.ResourceLogs {
+	now := uint64(time.Now().UnixNano())
+	return &logspb.ResourceLogs{
+		Resource: &resourcepb.Resource{
+			Attributes: []*commonpb.KeyValue{
+				{
+					Key:   "service.name",
+					Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: svc}},
+				},
+			},
+		},
+		ScopeLogs: []*logspb.ScopeLogs{
+			{
+				Scope: &commonpb.InstrumentationScope{Name: "test-scope"},
+				LogRecords: []*logspb.LogRecord{
+					{
+						ObservedTimeUnixNano: now,
+						Body:                 &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: body}},
+						SeverityNumber:       severity,
+						SeverityText:         severity.String(),
+						TraceId:              []byte("1234567890abcdef1234567890abcdef"),
+						SpanId:               []byte("abcd1234efgh5678"),
+					},
+				},
+			},
+		},
+	}
+}
+
 // Test helper: assert file exists.
 func assertFileExists(t *testing.T, path string, minSize int64) {
 	t.Helper()
@@ -233,4 +288,14 @@ func assertNoFile(t *testing.T, path string) {
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected file %s NOT to exist", path)
 	}
+}
+
+// Test helper: get file size.
+func fileSize(t *testing.T, path string) int64 {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Size()
 }

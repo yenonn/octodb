@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
@@ -37,17 +38,39 @@ func (s *WALStore) WriteTraces(ctx context.Context, tenantID string, spans []*tr
 			return fmt.Errorf("walstore: append: %w", err)
 		}
 	}
-
-	// Durability boundary: fsync before ACK.
 	if err := s.w.Sync(); err != nil {
 		return fmt.Errorf("walstore: sync: %w", err)
 	}
 	return nil
 }
 
+// WriteLogs writes each ResourceLogs as a separate WAL record, then fsyncs.
+func (s *WALStore) WriteLogs(ctx context.Context, tenantID string, logs []*logspb.ResourceLogs) error {
+	for _, rl := range logs {
+		data, err := proto.Marshal(rl)
+		if err != nil {
+			return err
+		}
+		if err := s.w.Append(data); err != nil {
+			return err
+		}
+	}
+	return s.w.Sync()
+}
+
 // ReadTraces is not supported in Block 1.
-func (s *WALStore) ReadTraces(ctx context.Context, req ReadRequest) ([]*tracepb.ResourceSpans, error) {
+func (s *WALStore) ReadTraces(ctx context.Context, req TraceReadRequest) ([]*tracepb.ResourceSpans, error) {
 	return nil, fmt.Errorf("walstore: ReadTraces not implemented in Block 1")
+}
+
+// ReadTraceByID is not supported in Block 1.
+func (s *WALStore) ReadTraceByID(ctx context.Context, tenantID, traceID string) ([]*tracepb.ResourceSpans, error) {
+	return nil, fmt.Errorf("walstore: ReadTraceByID not implemented in Block 1")
+}
+
+// ReadLogs is not supported in Block 1.
+func (s *WALStore) ReadLogs(ctx context.Context, req LogReadRequest) ([]*logspb.ResourceLogs, error) {
+	return nil, fmt.Errorf("walstore: ReadLogs not implemented in Block 1")
 }
 
 // Close cleanly shuts down the WAL.
