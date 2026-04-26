@@ -12,3 +12,6 @@ sst-*.pb
 manifest.log
 manifest.log.checkpoint
 amp
+coverage*.out
+*.log
+

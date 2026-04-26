@@ -5,6 +5,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -29,6 +30,8 @@ import (
 const (
 	MemtableFlushThreshold = 1024 // 1 KB — easy to trigger during testing
 	FlushPollInterval      = 1 * time.Second
+	DefaultRetention       = 7 * 24 * time.Hour // default segment retention for TTL
+	CompactionInterval     = 6 * time.Hour       // how often to trigger compaction
 )
 
 // MemtableMaxIdleFlush is the maximum duration between flushes even if size threshold isn't met.
@@ -44,6 +47,8 @@ type signalBundle struct {
 	locator    *index.TraceLocator             // two-level trace index
 	mu         sync.RWMutex                    // protects bundle-level mutable fields
 	lastWrite  time.Time                       // last time data was written to memtable
+	retention  time.Duration                  // TTL for this signal type (default = 7 days)
+	compactInterval time.Duration             // compaction ticker interval
 }
 
 type block2Store struct {
@@ -139,6 +144,10 @@ func NewBlock2Store(dataDir string) (Store, error) {
 	s.flushDone.Add(1)
 	go s.flushMonitor()
 
+	// Start TTL + Compaction sweeper.
+	s.flushDone.Add(1)
+	go s.ttlAndCompactionSweep()
+
 	return s, nil
 }
 
@@ -158,12 +167,14 @@ func (s *block2Store) createBundle(subdir, walBase string) (*signalBundle, error
 		return nil, fmt.Errorf("manifest open %s: %w", dir, err)
 	}
 	return &signalBundle{
-		walPath: walPath,
-		wal:     w,
-		subdir:  subdir,
-		man:     m,
-		set:     memtable.NewSet(),
-		locator: index.NewTraceLocator(),
+		walPath:         walPath,
+		wal:             w,
+		subdir:          subdir,
+		man:             m,
+		set:             memtable.NewSet(),
+		locator:         index.NewTraceLocator(),
+		retention:       DefaultRetention,
+		compactInterval: CompactionInterval,
 	}, nil
 }
 
@@ -761,6 +772,263 @@ func (s *block2Store) flushMonitor() {
 }
 
 // ---------------------------------------------------------------------------
+// TTL + Compaction sweeper
+// ---------------------------------------------------------------------------
+// TTL + Compaction sweeper
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) ttlAndCompactionSweep() {
+	defer s.flushDone.Done()
+	// Production tuning: per-bundle interval config (default: 1h) — can be overridden via signalBundle.compactInterval.
+	interval := s.traceBundle.compactInterval
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.stopFlush:
+			return
+		case <-ticker.C:
+			s.sweepBundleTTL(s.traceBundle)
+			s.sweepBundleTTL(s.logBundle)
+			s.sweepBundleTTL(s.metricBundle)
+			_ = s.compactBundle(s.traceBundle)
+			_ = s.compactBundle(s.logBundle)
+			_ = s.compactBundle(s.metricBundle)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Delete APIs
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) DeleteTraces(ctx context.Context, tenantID string, req TraceReadRequest) error {
+	// Find matching traces and insert tombstones.
+	active, flushing := s.traceBundle.set.Snapshot()
+	for _, tbl := range []*memtable.Memtable{active, flushing} {
+		if tbl == nil {
+			continue
+		}
+		tbl.AscendByType(otelutil.TypeTrace, func(key memtable.Key, value []byte) bool {
+			var rs tracepb.ResourceSpans
+			if err := proto.Unmarshal(value, &rs); err != nil {
+				return true
+			}
+			if !s.traceKeyMatches(rs, req) {
+				return true
+			}
+			// Write tombstone to WAL.
+			ts := fmt.Sprintf(`{"deleted":true,"key":%q}`, key.Key)
+			_ = s.traceBundle.wal.Append([]byte(ts))
+			// Insert tombstone into memtable.
+			s.traceBundle.set.InsertTombstone(key)
+			return true
+		})
+	}
+	_ = s.traceBundle.wal.Sync()
+	return nil
+}
+
+func (s *block2Store) DeleteLogs(ctx context.Context, tenantID string, req LogReadRequest) error {
+	active, flushing := s.logBundle.set.Snapshot()
+	for _, tbl := range []*memtable.Memtable{active, flushing} {
+		if tbl == nil {
+			continue
+		}
+		tbl.AscendByType(otelutil.TypeLog, func(key memtable.Key, value []byte) bool {
+			var rl logspb.ResourceLogs
+			if err := proto.Unmarshal(value, &rl); err != nil {
+				return true
+			}
+			if !s.logKeyMatches(rl, req) {
+				return true
+			}
+			ts := fmt.Sprintf(`{"deleted":true,"key":%q}`, key.Key)
+			_ = s.logBundle.wal.Append([]byte(ts))
+			s.logBundle.set.InsertTombstone(key)
+			return true
+		})
+	}
+	_ = s.logBundle.wal.Sync()
+	return nil
+}
+
+func (s *block2Store) DeleteMetrics(ctx context.Context, tenantID string, req MetricReadRequest) error {
+	active, flushing := s.metricBundle.set.Snapshot()
+	for _, tbl := range []*memtable.Memtable{active, flushing} {
+		if tbl == nil {
+			continue
+		}
+		tbl.AscendByType(otelutil.TypeMetric, func(key memtable.Key, value []byte) bool {
+			var rm metricspb.ResourceMetrics
+			if err := proto.Unmarshal(value, &rm); err != nil {
+				return true
+			}
+			if !s.metricKeyMatches(rm, req) {
+				return true
+			}
+			ts := fmt.Sprintf(`{"deleted":true,"key":%q}`, key.Key)
+			_ = s.metricBundle.wal.Append([]byte(ts))
+			s.metricBundle.set.InsertTombstone(key)
+			return true
+		})
+	}
+	_ = s.metricBundle.wal.Sync()
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Sweep bundle
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) sweepBundleTTL(b *signalBundle) {
+	if b == nil {
+		return
+	}
+	retention := b.retention
+	if retention <= 0 {
+		retention = DefaultRetention
+	}
+	cutoff := time.Now().Add(-retention).UnixNano()
+	var removedSeqs []int64
+	for _, rec := range b.man.AllRecords() {
+		if rec.CreatedAt > 0 && rec.CreatedAt < cutoff {
+			segPath := filepath.Join(s.dataDir, b.subdir, rec.SegmentFile)
+			bloomPath := filepath.Join(s.dataDir, b.subdir, rec.BloomFile)
+			idxPath := segPath + ".trace.index"
+			_ = os.Remove(segPath)
+			_ = os.Remove(bloomPath)
+			_ = os.Remove(idxPath)
+			removedSeqs = append(removedSeqs, rec.Sequence)
+		}
+	}
+	if len(removedSeqs) > 0 {
+		_ = b.man.RemoveRecords(func(rec manifest.Record) bool {
+			for _, seq := range removedSeqs {
+				if rec.Sequence == seq {
+					return false
+				}
+			}
+			return true
+		})
+	}
+}
+
+// compactBundle merges adjacent segments and rewrites manifest.
+func (s *block2Store) compactBundle(b *signalBundle) error {
+	records := b.man.AllRecords()
+	if len(records) < 2 {
+		return nil
+	}
+	// Find two adjacent old segments to merge.
+	// Simple heuristic: merge segments 0+1.
+	oldRecs := records[:2]
+
+	mergePath := filepath.Join(s.dataDir, b.subdir, fmt.Sprintf("sst-%08d.pb", b.man.NextSequence()))
+	mergeSeg, err := segment.Create(mergePath)
+	if err != nil {
+		return fmt.Errorf("compact: create segment: %w", err)
+	}
+
+	var bloomKeys []string
+	var minKey, maxKey manifest.SortKey
+	var first bool
+	// TODO: rebuild trace index from old segments' trace.index files.
+
+	for _, rec := range oldRecs {
+		segPath := filepath.Join(s.dataDir, b.subdir, rec.SegmentFile)
+		seg, err := segment.Open(segPath)
+		if err != nil {
+			continue
+		}
+		for {
+			data, err := seg.Next()
+			if err != nil {
+				break
+			}
+			if len(data) == 0 {
+				continue
+			}
+			// Skip tombstones in compaction.
+			if len(data) >= 9 {
+				if bytes.HasPrefix(data, []byte("{'deleted':true")) {
+					continue
+				}
+			}
+			_ = mergeSeg.Append(data)
+			bloomKeys = append(bloomKeys, extractServiceBloomKey(string(data)))
+		}
+		if len(seg.Footer().Blocks) > 0 {
+			for _, blk := range seg.Footer().Blocks {
+				if !first {
+					first = true
+					minKey = manifest.SortKeyFromString(blk.Key)
+					maxKey = minKey
+				} else {
+					mk := manifest.SortKeyFromString(blk.Key)
+					if blk.Key < minKey.Str {
+						minKey = mk
+					}
+					if blk.Key > maxKey.Str {
+						maxKey = mk
+					}
+				}
+			}
+		}
+		// TODO: rebuild trace index from old segments' trace.index files.
+		_ = seg.Close()
+	}
+
+	if err := mergeSeg.Close(""); err != nil {
+		return fmt.Errorf("compact: close segment: %w", err)
+	}
+
+	bf := bloom.Build(bloomKeys, 0.01)
+	bloomPath := mergePath + ".bloom"
+	_ = bf.Save(bloomPath)
+
+	// Use oldest CreatedAt among merged so TTL still applies.
+	var oldestCreated int64
+	for _, rec := range oldRecs {
+		if oldestCreated == 0 || (rec.CreatedAt > 0 && rec.CreatedAt < oldestCreated) {
+			oldestCreated = rec.CreatedAt
+		}
+	}
+
+	newRec := manifest.Record{
+		Sequence:      b.man.NextSequence(),
+		SegmentFile:   filepath.Base(mergePath),
+		BloomFile:     filepath.Base(bloomPath),
+		WALCheckpoint: "compact",
+		MinKey:        minKey,
+		MaxKey:        maxKey,
+		SpanCount:     int64(len(bloomKeys)),
+		CreatedAt:     oldestCreated,
+	}
+	if oldestCreated == 0 {
+		newRec.CreatedAt = time.Now().UnixNano()
+	}
+
+	oldSeqs := []int64{oldRecs[0].Sequence, oldRecs[1].Sequence}
+	if err := b.man.CompactRecords(oldSeqs, []manifest.Record{newRec}); err != nil {
+		return fmt.Errorf("compact: manifest rewrite: %w", err)
+	}
+
+	// Remove old files.
+	for _, rec := range oldRecs {
+		_ = os.Remove(filepath.Join(s.dataDir, b.subdir, rec.SegmentFile))
+		_ = os.Remove(filepath.Join(s.dataDir, b.subdir, rec.BloomFile))
+		_ = os.Remove(filepath.Join(s.dataDir, b.subdir, rec.SegmentFile+".trace.index"))
+	}
+
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 // Flush bundle
 // ---------------------------------------------------------------------------
 
@@ -866,9 +1134,7 @@ func (s *block2Store) flushBundle(b *signalBundle) error {
 	return nil
 }
 
-// ---------------------------------------------------------------------------
-// WriteMetrics
-// ---------------------------------------------------------------------------
+
 
 func (s *block2Store) WriteMetrics(ctx context.Context, tenantID string, metrics []*metricspb.ResourceMetrics) error {
 	for _, rm := range metrics {

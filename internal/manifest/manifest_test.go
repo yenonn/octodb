@@ -143,3 +143,59 @@ func TestManifestJSONLineFormat(t *testing.T) {
 		}
 	}
 }
+
+func TestRemoveRecords(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := Open(dir)
+	_ = m.AppendRecord(Record{Sequence: 1, SegmentFile: "seg1.pb"})
+	_ = m.AppendRecord(Record{Sequence: 2, SegmentFile: "seg2.pb"})
+	_ = m.AppendRecord(Record{Sequence: 3, SegmentFile: "seg3.pb"})
+
+	if err := m.RemoveRecords(func(rec Record) bool {
+		return rec.Sequence != 2
+	}); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	records := m.AllRecords()
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records, got %d", len(records))
+	}
+	for _, rec := range records {
+		if rec.Sequence == 2 {
+			t.Fatal("record 2 should have been removed")
+		}
+	}
+}
+
+func TestCompactRecords(t *testing.T) {
+	dir := t.TempDir()
+	m, _ := Open(dir)
+	_ = m.AppendRecord(Record{Sequence: 1, SegmentFile: "seg1.pb"})
+	_ = m.AppendRecord(Record{Sequence: 2, SegmentFile: "seg2.pb"})
+	_ = m.AppendRecord(Record{Sequence: 3, SegmentFile: "seg3.pb"})
+
+	newRec := Record{Sequence: 10, SegmentFile: "seg10.pb"}
+	if err := m.CompactRecords([]int64{1, 2}, []Record{newRec}); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	records := m.AllRecords()
+	if len(records) != 2 {
+		t.Fatalf("expected 2 records (3 old - 2 removed + 1 new), got %d", len(records))
+	}
+	for _, rec := range records {
+		if rec.Sequence == 1 || rec.Sequence == 2 {
+			t.Fatal("old compacted records should be removed")
+		}
+	}
+	foundNew := false
+	for _, rec := range records {
+		if rec.Sequence == 10 {
+			foundNew = true
+		}
+	}
+	if !foundNew {
+		t.Fatal("expected new compacted record")
+	}
+}

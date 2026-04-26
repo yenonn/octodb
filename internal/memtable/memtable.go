@@ -21,8 +21,9 @@ type Key struct {
 
 // Item is a single entry in the memtable.
 type Item struct {
-	Key   Key
-	Value []byte // raw proto bytes
+	Key     Key
+	Value   []byte // raw proto bytes
+	Deleted bool   // tombstone marker
 }
 
 func (i Item) Less(than btree.Item) bool {
@@ -51,6 +52,12 @@ func New() *Memtable {
 func (m *Memtable) Insert(key Key, value []byte) {
 	m.data.ReplaceOrInsert(Item{Key: key, Value: value})
 	m.size += int64(len(key.Key) + len(value))
+}
+
+// InsertTombstone adds a tombstone entry for deletion.
+func (m *Memtable) InsertTombstone(key Key) {
+	m.data.ReplaceOrInsert(Item{Key: key, Deleted: true})
+	m.size += int64(len(key.Key))
 }
 
 // Size returns estimated bytes held by the memtable.
@@ -118,6 +125,13 @@ func (s *Set) Insert(key Key, value []byte) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	s.active.Insert(key, value)
+}
+
+// InsertTombstone writes a tombstone into the active memtable.
+func (s *Set) InsertTombstone(key Key) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	s.active.InsertTombstone(key)
 }
 
 // ActiveSize returns the current active memtable size.

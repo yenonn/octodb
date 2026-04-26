@@ -32,6 +32,16 @@ type Store interface {
 	WriteMetrics(ctx context.Context, tenantID string, metrics []*metricspb.ResourceMetrics) error
 	ReadMetrics(ctx context.Context, req MetricReadRequest) ([]*metricspb.ResourceMetrics, error)
 
+	// DeleteTraces marks spans matching the predicate as deleted.
+	// Tombstones are inserted into the memtable and WAL.
+	DeleteTraces(ctx context.Context, tenantID string, req TraceReadRequest) error
+
+	// DeleteLogs marks logs matching the predicate as deleted.
+	DeleteLogs(ctx context.Context, tenantID string, req LogReadRequest) error
+
+	// DeleteMetrics marks metrics matching the predicate as deleted.
+	DeleteMetrics(ctx context.Context, tenantID string, req MetricReadRequest) error
+
 	Close() error
 }
 

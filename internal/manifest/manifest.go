@@ -24,6 +24,7 @@ type Record struct {
 	MaxKey        SortKey    `json:"max_key"`
 	SpanCount     int64      `json:"span_count"`
 	Checksum      string     `json:"checksum"`
+	CreatedAt     int64      `json:"created_at"`       // unix nano for TTL
 }
 
 // SortKey mirrors otelutil.SortKey as JSON-friendly strings.
@@ -222,6 +223,93 @@ func (m *Manager) AllRecords() []Record {
 	out := make([]Record, len(m.records))
 	copy(out, m.records)
 	return out
+}
+
+// RemoveRecords drops matching records and rewrites the manifest log atomically.
+func (m *Manager) RemoveRecords(keep func(Record) bool) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Filter in-memory records.
+	var filtered []Record
+	for _, rec := range m.records {
+		if keep(rec) {
+			filtered = append(filtered, rec)
+		}
+	}
+
+	// Rewrite manifest log.
+	tmpPath := m.manifestPath + ".tmp"
+	f, err := os.OpenFile(tmpPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return fmt.Errorf("manifest remove open: %w", err)
+	}
+	for _, rec := range filtered {
+		data, err := json.Marshal(rec)
+		if err != nil {
+			_ = f.Close()
+			return err
+		}
+		if _, err := f.Write(append(data, '\n')); err != nil {
+			_ = f.Close()
+			return fmt.Errorf("manifest remove write: %w", err)
+		}
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("manifest remove fsync: %w", err)
+	}
+	_ = f.Close()
+
+	if err := os.Rename(tmpPath, m.manifestPath); err != nil {
+		return fmt.Errorf("manifest remove rename: %w", err)
+	}
+
+	// Sync directory.
+	dir, err := os.Open(m.dir)
+	if err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+
+	m.records = filtered
+	// Reset walFiles for removed records.
+	m.walFiles = make(map[string]int64)
+	for _, rec := range filtered {
+		if pos, err := ParseWALCheckpoint(rec.WALCheckpoint); err == nil {
+			m.walFiles[pos.File] = pos.Offset
+		}
+	}
+
+	// Reset nextSeq.
+	m.nextSeq = 1
+	for _, rec := range filtered {
+		if rec.Sequence >= m.nextSeq {
+			m.nextSeq = rec.Sequence + 1
+		}
+	}
+	return nil
+}
+
+// CompactRecords removes old segment records and appends new compacted ones.
+func (m *Manager) CompactRecords(oldSeqs []int64, newRecs []Record) error {
+	keep := func(rec Record) bool {
+		for _, seq := range oldSeqs {
+			if rec.Sequence == seq {
+				return false
+			}
+		}
+		return true
+	}
+	if err := m.RemoveRecords(keep); err != nil {
+		return err
+	}
+	for _, rec := range newRecs {
+		if err := m.AppendRecord(rec); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // NextSequence returns the next sequence number to use.
