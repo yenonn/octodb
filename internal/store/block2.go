@@ -214,7 +214,7 @@ func (s *block2Store) createBundle(subdir string) (*signalBundle, error) {
 	}
 
 	walPath := filepath.Join(dir, fmt.Sprintf("%06d.wal", walSeq))
-	w, err := wal.Open(walPath)
+	w, err := wal.OpenAsync(walPath, 100*time.Millisecond)
 	if err != nil {
 		return nil, fmt.Errorf("wal open %s: %w", walPath, err)
 	}
@@ -546,9 +546,7 @@ func (s *block2Store) WriteTraces(ctx context.Context, tenantID string, spans []
 	if err := s.traceBundle.wal.AppendBatch(batch); err != nil {
 		return err
 	}
-	if err := s.traceBundle.wal.Sync(); err != nil {
-		return err
-	}
+	// WAL syncs in background - no blocking sync here
 	for _, data := range batch {
 		key, data2 := s.extractTraceSortKey(data)
 		s.traceBundle.insert(key, data2)
@@ -749,9 +747,7 @@ func (s *block2Store) WriteLogs(ctx context.Context, tenantID string, logs []*lo
 	if err := s.logBundle.wal.AppendBatch(batch); err != nil {
 		return err
 	}
-	if err := s.logBundle.wal.Sync(); err != nil {
-		return err
-	}
+	// WAL syncs in background - no blocking sync here
 	for _, data := range batch {
 		key, data2 := s.extractLogSortKey(data)
 		s.logBundle.insert(key, data2)
@@ -1349,7 +1345,7 @@ func (s *block2Store) flushBundle(b *signalBundle) error {
 	_ = oldWAL.Close()
 	_ = os.Rename(oldPath, oldPath+".tombstone")
 	b.walSeq++
-	w, err := wal.Open(b.walPath())
+	w, err := wal.OpenAsync(b.walPath(), 100*time.Millisecond)
 	if err != nil {
 		return fmt.Errorf("flush: reopen wal: %w", err)
 	}
@@ -1374,9 +1370,7 @@ func (s *block2Store) WriteMetrics(ctx context.Context, tenantID string, metrics
 	if err := s.metricBundle.wal.AppendBatch(batch); err != nil {
 		return err
 	}
-	if err := s.metricBundle.wal.Sync(); err != nil {
-		return err
-	}
+	// WAL syncs in background - no blocking sync here
 	for _, data := range batch {
 		key, data2 := s.extractMetricSortKey(data)
 		s.metricBundle.insert(key, data2)

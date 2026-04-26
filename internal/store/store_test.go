@@ -1579,3 +1579,61 @@ func BenchmarkConcurrentWrites(b *testing.B) {
 	}
 }
 
+func BenchmarkWriteLogs(b *testing.B) {
+	dir := b.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	st, _ := NewBlock2Store(dataDir)
+	defer st.Close()
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	sizes := []int{1, 10, 100}
+
+	for _, count := range sizes {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			logs := make([]*logspb.ResourceLogs, count)
+			for i := range logs {
+				logs[i] = makeTestLog("bench-svc", fmt.Sprintf("log-%d", i), logspb.SeverityNumber_SEVERITY_NUMBER_INFO, nil, nil, now)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := st.WriteLogs(ctx, "default", logs); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkWriteMetrics(b *testing.B) {
+	dir := b.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	st, _ := NewBlock2Store(dataDir)
+	defer st.Close()
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	sizes := []int{1, 10, 100}
+
+	for _, count := range sizes {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			metrics := make([]*metricspb.ResourceMetrics, count)
+			for i := range metrics {
+				metrics[i] = makeTestMetric("bench-svc", fmt.Sprintf("metric-%d", i), float64(i), now)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := st.WriteMetrics(ctx, "default", metrics); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+

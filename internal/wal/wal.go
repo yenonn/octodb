@@ -7,15 +7,22 @@ import (
 	"io"
 	"os"
 	"sync"
+	"time"
 )
 
 // Writer manages an append-only WAL file.
 // Safe for concurrent use — a mutex serialises appenders.
+// Supports async sync for high throughput.
 type Writer struct {
 	mu     sync.Mutex
 	file   *os.File
 	path   string
 	offset int64 // current write offset in bytes
+
+	// async sync fields
+	syncTicker *time.Ticker
+	syncDone  chan struct{}
+	syncErr   error
 }
 
 // Open opens (or creates) a WAL file for appending.
@@ -31,11 +38,55 @@ func Open(path string) (*Writer, error) {
 		return nil, fmt.Errorf("stat wal %q: %w", path, err)
 	}
 
-	return &Writer{
+	w := &Writer{
 		file:   f,
 		path:   path,
 		offset: info.Size(),
-	}, nil
+	}
+	return w, nil
+}
+
+// OpenAsync opens a WAL with background sync.
+// interval controls how often sync is called (default 100ms).
+func OpenAsync(path string, interval time.Duration) (*Writer, error) {
+	w, err := Open(path)
+	if err != nil {
+		return nil, err
+	}
+	if interval <= 0 {
+		interval = 100 * time.Millisecond
+	}
+	w.syncTicker = time.NewTicker(interval)
+	w.syncDone = make(chan struct{})
+	go w.backgroundSync()
+	return w, nil
+}
+
+// backgroundSync periodically syncs WAL to disk.
+func (w *Writer) backgroundSync() {
+	for {
+		select {
+		case <-w.syncTicker.C:
+			w.file.Sync()
+		case <-w.syncDone:
+			w.syncTicker.Stop()
+			w.file.Sync()
+			return
+		}
+	}
+}
+
+// Close closes the underlying file.
+func (w *Writer) Close() error {
+	if w.syncDone != nil {
+		close(w.syncDone)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file != nil {
+		return w.file.Close()
+	}
+	return nil
 }
 
 // AppendBatch appends multiple records in one atomic write.
@@ -124,13 +175,6 @@ func (w *Writer) Append(data []byte) error {
 // Must be called after a batch of Appends before ACKing the caller.
 func (w *Writer) Sync() error {
 	return w.file.Sync()
-}
-
-// Close closes the underlying file.
-func (w *Writer) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.file.Close()
 }
 
 // Offset returns the current file size / next write offset.
