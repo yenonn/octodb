@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"github.com/golang/snappy"
 )
 
 const (
@@ -27,10 +29,11 @@ type BlockEntry struct {
 
 // Footer is the JSON metadata at the end of a segment file.
 type Footer struct {
-	Version    int          `json:"version"`
-	NumBlocks  int          `json:"num_blocks"`
-	NumRecords int64        `json:"num_records"`
-	Blocks     []BlockEntry `json:"blocks"`
+	Version     int          `json:"version"`
+	NumBlocks   int          `json:"num_blocks"`
+	NumRecords  int64        `json:"num_records"`
+	Blocks      []BlockEntry `json:"blocks"`
+	Compression string       `json:"compression,omitempty"` // e.g. "snappy" or ""
 }
 
 // Writer serializes sorted records to a segment file.
@@ -41,6 +44,7 @@ type Writer struct {
 	blocks            []BlockEntry
 	count             int64
 	pendingBlockBytes int64
+	compressedCount   int64 // number of records that were compressed
 }
 
 // Create opens a new segment file for writing.
@@ -60,26 +64,67 @@ func (w *Writer) CurrentOffset() (int64, error) {
 	return w.f.Seek(0, io.SeekCurrent)
 }
 
+// compressedLen returns the wire length after Snappy compressing a value.
+func compressedLen(value []byte) (wireLen int, origLen int, comp bool) {
+	compressed := snappy.Encode(nil, value)
+	n := len(compressed)
+	orig := len(value)
+	if n >= orig-16 && orig < 256 {
+		// No compression savings, store uncompressed
+		// On-disk after length header: flag(1) + data(orig) = orig + 1 bytes
+		return orig + 1, orig, false
+	}
+	// Compressed
+	// On-disk after length header: flag(1) + origLen(4) + compressedData = 5 + n bytes
+	return n + 5, orig, true
+}
+
 // Append writes one length-prefixed record. Must be called in ascending SortKey order.
+// Records are compressed transparently with Snappy if this saves space.
 func (w *Writer) Append(value []byte) error {
 	n := len(value)
 	if n > 0x7FFFFFFF {
 		return fmt.Errorf("segment: record too large (%d bytes)", n)
 	}
 
-	if err := binary.Write(w.f, binary.BigEndian, uint32(n)); err != nil {
-		return fmt.Errorf("segment: write length: %w", err)
-	}
-	if _, err := w.f.Write(value); err != nil {
-		return fmt.Errorf("segment: write data: %w", err)
-	}
-	w.count++
+	wireLen, origLen, comp := compressedLen(value)
 
-	// Index every ~BlockSize bytes.
-	w.pendingBlockBytes += int64(4 + n)
+	if comp {
+		// Compressed record marker: [original_length uint32][compressed_data]
+		compressed := snappy.Encode(nil, value)
+		if err := binary.Write(w.f, binary.BigEndian, uint32(wireLen)); err != nil {
+			return fmt.Errorf("segment: write compressed length: %w", err)
+		}
+		if _, err := w.f.Write([]byte{1}); err != nil {
+			return fmt.Errorf("segment: write compression flag: %w", err)
+		}
+		if err := binary.Write(w.f, binary.BigEndian, uint32(origLen)); err != nil {
+			return fmt.Errorf("segment: write original length: %w", err)
+		}
+		if _, err := w.f.Write(compressed); err != nil {
+			return fmt.Errorf("segment: write compressed data: %w", err)
+		}
+		w.count++
+		w.compressedCount++
+		w.pendingBlockBytes += int64(wireLen + 4)
+	} else {
+		// Uncompressed record.
+		if err := binary.Write(w.f, binary.BigEndian, uint32(wireLen)); err != nil {
+			return fmt.Errorf("segment: write length: %w", err)
+		}
+		if _, err := w.f.Write([]byte{0}); err != nil {
+			return fmt.Errorf("segment: write uncompressed flag: %w", err)
+		}
+		if _, err := w.f.Write(value); err != nil {
+			return fmt.Errorf("segment: write data: %w", err)
+		}
+		w.count++
+		w.pendingBlockBytes += int64(wireLen + 4)
+	}
+
 	if w.pendingBlockBytes >= BlockSize {
 		offset, _ := w.f.Seek(0, io.SeekCurrent)
-		w.blocks = append(w.blocks, BlockEntry{Offset: offset - int64(w.pendingBlockBytes)})
+		w.blocks = append(w.blocks, BlockEntry{Offset: offset - w.pendingBlockBytes})
 		w.pendingBlockBytes = 0
 	}
 
@@ -94,11 +139,17 @@ func (w *Writer) Close(lastKey string) error {
 	}
 
 	footer := Footer{
-		Version:    1,
-		NumBlocks:  len(w.blocks),
-		NumRecords: w.count,
-		Blocks:     w.blocks,
+		Version:     1,
+		NumBlocks:   len(w.blocks),
+		NumRecords:  w.count,
+		Blocks:      w.blocks,
+		Compression: "snappy",
 	}
+	// If no records were compressed, don't claim snappy.
+	if w.compressedCount == 0 {
+		footer.Compression = ""
+	}
+
 	footerData, err := json.Marshal(footer)
 	if err != nil {
 		return fmt.Errorf("segment: marshal footer: %w", err)
@@ -249,14 +300,50 @@ func (r *Reader) Next() ([]byte, error) {
 		return nil, fmt.Errorf("segment: record extends past data region")
 	}
 
-	data := make([]byte, length)
-	if _, err := io.ReadFull(r.f, data); err != nil {
+	flag := make([]byte, 1)
+	if _, err := io.ReadFull(r.f, flag); err != nil {
 		if err == io.EOF {
-			return nil, fmt.Errorf("segment: truncated record (expected %d)", length)
+			return nil, fmt.Errorf("segment: truncated record at flag byte")
 		}
-		return nil, fmt.Errorf("segment: read data: %w", err)
+		return nil, fmt.Errorf("segment: read flag: %w", err)
 	}
-	return data, nil
+
+	switch flag[0] {
+	case 0:
+		if length < 1 {
+			return nil, fmt.Errorf("segment: uncompressed record too short")
+		}
+		data := make([]byte, length-1)
+		if _, err := io.ReadFull(r.f, data); err != nil {
+			if err == io.EOF {
+				return nil, fmt.Errorf("segment: truncated record (expected %d)", length-1)
+			}
+			return nil, fmt.Errorf("segment: read data: %w", err)
+		}
+		return data, nil
+	case 1:
+		var origLen uint32
+		if err := binary.Read(r.f, binary.BigEndian, &origLen); err != nil {
+			return nil, fmt.Errorf("segment: read original length: %w", err)
+		}
+		if length < 5 {
+			return nil, fmt.Errorf("segment: compressed record too short")
+		}
+		compressed := make([]byte, length-5)
+		if _, err := io.ReadFull(r.f, compressed); err != nil {
+			return nil, fmt.Errorf("segment: read compressed data: %w", err)
+		}
+		data, err := snappy.Decode(nil, compressed)
+		if err != nil {
+			return nil, fmt.Errorf("segment: snappy decode: %w", err)
+		}
+		if uint32(len(data)) != origLen {
+			return nil, fmt.Errorf("segment: uncompressed length mismatch: expected %d, got %d", origLen, len(data))
+		}
+		return data, nil
+	default:
+		return nil, fmt.Errorf("segment: unknown compression flag %d", flag[0])
+	}
 }
 
 // Close closes the underlying file.

@@ -3,6 +3,7 @@ module github.com/octodb/octodb
 go 1.26
 
 require (
+	github.com/golang/snappy v1.0.0
 	github.com/google/btree v1.1.2
 	go.opentelemetry.io/proto/otlp v1.1.0
 	google.golang.org/grpc v1.63.0

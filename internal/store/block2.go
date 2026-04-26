@@ -31,15 +31,19 @@ const (
 	FlushPollInterval      = 1 * time.Second
 )
 
+// MemtableMaxIdleFlush is the maximum duration between flushes even if size threshold isn't met.
+const MemtableMaxIdleFlush = 30 * time.Second
+
 // signalBundle holds everything for one signal type (traces or logs).
 type signalBundle struct {
-	walPath string
-	wal     *wal.Writer
-	subdir  string                          // subdirectory under dataDir, e.g. "traces" / "logs"
-	man     *manifest.Manager               // per-signal manifest
-	set     *memtable.Set                   // dual memtable
-	locator *index.TraceLocator             // two-level trace index
-	mu      sync.RWMutex                    // protects bundle-level mutable fields
+	walPath    string
+	wal        *wal.Writer
+	subdir     string                          // subdirectory under dataDir, e.g. "traces" / "logs"
+	man        *manifest.Manager               // per-signal manifest
+	set        *memtable.Set                   // dual memtable
+	locator    *index.TraceLocator             // two-level trace index
+	mu         sync.RWMutex                    // protects bundle-level mutable fields
+	lastWrite  time.Time                       // last time data was written to memtable
 }
 
 type block2Store struct {
@@ -329,6 +333,21 @@ func (s *block2Store) extractMetricSortKey(raw []byte) (memtable.Key, []byte) {
 	return memtable.Key{DType: otelutil.TypeMetric, Key: key.Key()}, raw
 }
 
+// insert adds an item to the active memtable and records the write time.
+func (b *signalBundle) insert(key memtable.Key, value []byte) {
+	b.set.Insert(key, value)
+	b.lastWrite = time.Now()
+}
+
+// flushIdleSize returns true if the bundle should be flushed based on idle timeout.
+func (b *signalBundle) flushIdleSize() int64 {
+	if time.Since(b.lastWrite) > MemtableMaxIdleFlush && b.set.ActiveSize() > 0 {
+		// treat as threshold met to force flush
+		return MemtableFlushThreshold
+	}
+	return b.set.ActiveSize()
+}
+
 // ---------------------------------------------------------------------------
 // WriteTraces
 // ---------------------------------------------------------------------------
@@ -349,7 +368,7 @@ func (s *block2Store) WriteTraces(ctx context.Context, tenantID string, spans []
 	for _, rs := range spans {
 		data, _ := proto.Marshal(rs)
 		key, data2 := s.extractTraceSortKey(data)
-		s.traceBundle.set.Insert(key, data2)
+		s.traceBundle.insert(key, data2)
 	}
 	return nil
 }
@@ -549,7 +568,7 @@ func (s *block2Store) WriteLogs(ctx context.Context, tenantID string, logs []*lo
 	for _, rl := range logs {
 		data, _ := proto.Marshal(rl)
 		key, data2 := s.extractLogSortKey(data)
-		s.logBundle.set.Insert(key, data2)
+		s.logBundle.insert(key, data2)
 	}
 	return nil
 }
@@ -728,13 +747,13 @@ func (s *block2Store) flushMonitor() {
 			}
 			return
 		case <-ticker.C:
-			if s.traceBundle.set.ActiveSize() >= MemtableFlushThreshold {
+			if s.traceBundle.flushIdleSize() >= MemtableFlushThreshold {
 				_ = s.flushBundle(s.traceBundle)
 			}
-			if s.logBundle.set.ActiveSize() >= MemtableFlushThreshold {
+			if s.logBundle.flushIdleSize() >= MemtableFlushThreshold {
 				_ = s.flushBundle(s.logBundle)
 			}
-			if s.metricBundle.set.ActiveSize() >= MemtableFlushThreshold {
+			if s.metricBundle.flushIdleSize() >= MemtableFlushThreshold {
 				_ = s.flushBundle(s.metricBundle)
 			}
 		}
@@ -867,7 +886,7 @@ func (s *block2Store) WriteMetrics(ctx context.Context, tenantID string, metrics
 	for _, rm := range metrics {
 		data, _ := proto.Marshal(rm)
 		key, data2 := s.extractMetricSortKey(data)
-		s.metricBundle.set.Insert(key, data2)
+		s.metricBundle.insert(key, data2)
 	}
 	return nil
 }

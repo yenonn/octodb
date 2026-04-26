@@ -2,9 +2,11 @@ package wal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
@@ -88,9 +90,51 @@ func ReplayToRawSlice(path string) ([][]byte, error) {
 // TODO(gate-0): Replay from a specific offset (requires manifest checkpoint).
 // For Block 1, replay always starts at offset 0.
 func ReplayFromOffset(ctx context.Context, path string, offset int64, fn func(raw []byte, rs *tracepb.ResourceSpans) error) error {
-	// TBD when manifest checkpointing is implemented in Block 2.
-	_ = offset
-	return Replay(path, fn)
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	// Skip to offset.
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return fmt.Errorf("wal: seek to offset %d: %w", offset, err)
+		}
+	}
+
+	// Consume corrupt records until a valid one is found or EOF.
+	r := NewReader(f)
+	for {
+		data, err := r.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			if err.Error() == "wal: record checksum mismatch" {
+				fmt.Fprintf(os.Stderr, "wal: skipping corrupt record after offset %d: %v\n", offset, err)
+				continue
+			}
+			// Truncated record at the write boundary is expected — stop here.
+			if errors.Is(err, io.ErrUnexpectedEOF) || strings.Contains(err.Error(), "truncated") {
+				break
+			}
+			return err
+		}
+		var rs tracepb.ResourceSpans
+		if err := proto.Unmarshal(data, &rs); err != nil {
+			// Proto unmarshal failure implies corrupt payload even though CRC passed.
+			fmt.Fprintf(os.Stderr, "wal: skipping unmarshalable record: %v\n", err)
+			continue
+		}
+		if err := fn(data, &rs); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------

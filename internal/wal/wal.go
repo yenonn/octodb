@@ -3,6 +3,7 @@ package wal
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"sync"
@@ -38,7 +39,7 @@ func Open(path string) (*Writer, error) {
 }
 
 // Append writes a length-prefixed record to the WAL.
-// Format: [4 bytes big-endian length][N bytes payload].
+// Format: [4 bytes big-endian length][4 bytes CRC32][N bytes payload].
 func (w *Writer) Append(data []byte) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -51,9 +52,11 @@ func (w *Writer) Append(data []byte) error {
 		return fmt.Errorf("wal: record too large (%d bytes)", n)
 	}
 
-	buf := make([]byte, 4+n)
+	checksum := crc32.ChecksumIEEE(data)
+	buf := make([]byte, 8+n)
 	binary.BigEndian.PutUint32(buf[:4], uint32(n))
-	copy(buf[4:], data)
+	binary.BigEndian.PutUint32(buf[4:8], checksum)
+	copy(buf[8:], data)
 
 	written, err := w.file.Write(buf)
 	if err != nil {
@@ -107,6 +110,9 @@ func NewReaderFromFile(path string) (*Reader, error) {
 	return &Reader{r: f, f: f}, nil
 }
 
+// ErrBadCRC is returned when a WAL record fails its checksum.
+var ErrBadCRC = fmt.Errorf("wal: record checksum mismatch")
+
 // Next reads the next record.
 // Returns io.EOF when there are no more complete records.
 func (r *Reader) Next() ([]byte, error) {
@@ -118,12 +124,24 @@ func (r *Reader) Next() ([]byte, error) {
 		return nil, fmt.Errorf("wal: read length: %w", err)
 	}
 
+	var storedCRC uint32
+	if err := binary.Read(r.r, binary.BigEndian, &storedCRC); err != nil {
+		if err == io.EOF {
+			return nil, fmt.Errorf("wal: record truncated after length (CRC)")
+		}
+		return nil, fmt.Errorf("wal: read crc: %w", err)
+	}
+
 	data := make([]byte, length)
 	if _, err := io.ReadFull(r.r, data); err != nil {
 		if err == io.EOF {
 			return nil, fmt.Errorf("wal: record truncated (expected %d bytes, got EOF)", length)
 		}
 		return nil, fmt.Errorf("wal: read data: %w", err)
+	}
+
+	if crc32.ChecksumIEEE(data) != storedCRC {
+		return nil, ErrBadCRC
 	}
 	return data, nil
 }
