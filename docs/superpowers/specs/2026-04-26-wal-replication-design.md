@@ -239,6 +239,90 @@ func BenchmarkReplicatedWrites(b *testing.B) {
 3. **TestFailover** — Verify client fails over on leader crash
 4. **TestRecover** — Verify state recovers after restart
 
+## Read Scaling (Bonus)
+
+Replication enables read scaling across followers!
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  Read Distribution                       │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  [Client] ──→ [Leader]  → [Follower A] → [Follower B]   │
+│     │              │           │             │              │
+│  Reads scale    │        ┌────┴────┐      ┌────┴────┐      │
+│              (local)  │  local   │      │  local   │      │
+│                       │  reads   │      │  reads   │      │
+│                       └─────────┘      └─────────┘      │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Read Options
+
+| Read From | Latency | Consistency | Scaling |
+|----------|---------|-------------|----------|
+| **Leader** | 2.5 µs | Strong | ❌ No |
+| **Follower (local)** | ~0.5ms | Eventual | ✅ Yes |
+| **Closest replica** | ~0.1ms | Eventual | ✅ Yes |
+
+### Use Cases
+
+| Use Case | Read From | Why |
+|---------|---------|-----|
+| **Dashboard** | Follower | Stale OK, scale reads |
+| **Debug trace ID** | Leader | Strong consistency |
+| **Time-range query** | Follower | Stale OK, large result |
+| **Real-time alert** | Leader | Must see all data |
+
+### Implementation
+
+```go
+type ReadRequest struct {
+    TenantID string
+    Service string
+    
+    // Read options
+    PreferLeader bool      // Force leader read
+    AllowStale bool       // Allow follower read
+    MaxStaleness time.Duration // How stale is OK
+}
+
+func (s *Store) ReadTraces(ctx context.Context, req ReadRequest) ([]*tracepb.ResourceSpans, error) {
+    // Read from leader for consistency
+    if req.PreferLeader || s.isLeader() {
+        return s.readFromLeader(ctx, req)
+    }
+    
+    // Read from follower for scale
+    if req.AllowStale {
+        return s.readFromFollower(ctx, req)
+    }
+    
+    // Default: leader
+    return s.readFromLeader(ctx, req)
+}
+```
+
+### Benchmark Potential
+
+With 3 replication nodes:
+- **Leader reads**: ~400K/sec (local)
+- **Follower reads**: ~400K/sec each
+- **Total**: ~1.2M/sec across all nodes
+
+This provides **3x read scaling** without additional complexity!
+
+### Comparison with Single Node
+
+| Metric | Single Node | 3 Replicas |
+|--------|------------|------------|
+| Write throughput | 130K/sec | 130K/sec |
+| Read throughput | 400K/sec | 1.2M/sec |
+| Availability | 1 node | 3 nodes |
+| Data durability | 10ms loss | 0ms loss |
+
 ## When NOT to Use Replication
 
 For observability (traces, logs, metrics), consider these alternatives:
@@ -257,6 +341,17 @@ For observability (traces, logs, metrics), consider these alternatives:
 | No replication | Low | Low | Low |
 
 **Recommendation for OctoDB:** Use single-node with async WAL sync for max throughput, rely on upstream Kafka/Pulsar for durability.
+
+### Read Replicas vs Full Replication
+
+Full replication enables read scaling — but you can also add read-only replicas without write capability:
+
+| Configuration | Write | Read | Notes |
+|---------------|-------|------|-------|
+| Full replication | Leader only | All | Current spec |
+| Read replicas | Leader only | Read-only | Simpler, same read scale |
+
+**Recommendation:** Add read-only replicas (without Raft) for read scaling — simpler than full replication.
 
 ## Trade-offs
 
