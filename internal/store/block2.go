@@ -1143,6 +1143,7 @@ func (s *block2Store) flushBundle(b *signalBundle) error {
 		MaxKey:        maxKey,
 		SpanCount:     int64(len(bloomKeys)),
 		Checksum:      "",
+		CreatedAt:     time.Now().UnixNano(),
 	}
 	if err := b.man.AppendRecord(rec); err != nil {
 		return fmt.Errorf("flush: manifest: %w", err)
