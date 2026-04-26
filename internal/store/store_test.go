@@ -1637,3 +1637,55 @@ func BenchmarkWriteMetrics(b *testing.B) {
 	}
 }
 
+func BenchmarkWriteMixedSignals(b *testing.B) {
+	dir := b.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	st, _ := NewBlock2Store(dataDir)
+	defer st.Close()
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	counts := []struct {
+		traces  int
+		logs    int
+		metrics int
+	}{
+		{1, 1, 1},
+		{10, 10, 10},
+		{100, 100, 100},
+	}
+
+	for _, c := range counts {
+		b.Run(fmt.Sprintf("traces=%d_logs=%d_metrics=%d", c.traces, c.logs, c.metrics), func(b *testing.B) {
+			traces := make([]*tracepb.ResourceSpans, c.traces)
+			logs := make([]*logspb.ResourceLogs, c.logs)
+			metrics := make([]*metricspb.ResourceMetrics, c.metrics)
+
+			for i := range traces {
+				traces[i] = makeTestTrace("bench-svc", fmt.Sprintf("span-%d", i), now)
+			}
+			for i := range logs {
+				logs[i] = makeTestLog("bench-svc", fmt.Sprintf("log-%d", i), logspb.SeverityNumber_SEVERITY_NUMBER_INFO, nil, nil, now)
+			}
+			for i := range metrics {
+				metrics[i] = makeTestMetric("bench-svc", fmt.Sprintf("metric-%d", i), float64(i), now)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := st.WriteTraces(ctx, "default", traces); err != nil {
+					b.Fatal(err)
+				}
+				if err := st.WriteLogs(ctx, "default", logs); err != nil {
+					b.Fatal(err)
+				}
+				if err := st.WriteMetrics(ctx, "default", metrics); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
