@@ -105,6 +105,139 @@ func makeTestResourceSpans(svc, spanName string) *tracepb.ResourceSpans {
 	}
 }
 
+func TestAppendBatchRoundTrip(t *testing.T) {
+	path := "test_batch_roundtrip.wal"
+	defer os.Remove(path)
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+
+	// Build a batch of 20 records.
+	var originals []*tracepb.ResourceSpans
+	var batch [][]byte
+	for i := 0; i < 20; i++ {
+		rs := makeTestResourceSpans("batch-service", fmt.Sprintf("batch-span-%d", i))
+		originals = append(originals, rs)
+		data, err := proto.Marshal(rs)
+		if err != nil {
+			t.Fatalf("marshal %d: %v", i, err)
+		}
+		batch = append(batch, data)
+	}
+
+	if err := w.AppendBatch(batch); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	if err := w.Sync(); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Replay and verify all 20 records survived.
+	replayed, err := ReplayToSlice(path)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(replayed) != 20 {
+		t.Fatalf("expected 20 records, got %d", len(replayed))
+	}
+	for i, rs := range replayed {
+		if !proto.Equal(originals[i], rs) {
+			t.Fatalf("record %d mismatch after replay", i)
+		}
+	}
+}
+
+func TestAppendBatchEmpty(t *testing.T) {
+	path := "test_batch_empty.wal"
+	defer os.Remove(path)
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+	defer w.Close()
+
+	// Empty batch should be a no-op.
+	if err := w.AppendBatch(nil); err != nil {
+		t.Fatalf("AppendBatch(nil) should succeed: %v", err)
+	}
+	if err := w.AppendBatch([][]byte{}); err != nil {
+		t.Fatalf("AppendBatch(empty) should succeed: %v", err)
+	}
+	if w.Offset() != 0 {
+		t.Fatalf("expected offset 0 after empty batches, got %d", w.Offset())
+	}
+}
+
+func TestAppendBatchRejectsEmptyRecord(t *testing.T) {
+	path := "test_batch_reject.wal"
+	defer os.Remove(path)
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+	defer w.Close()
+
+	batch := [][]byte{[]byte("valid"), {}}
+	if err := w.AppendBatch(batch); err == nil {
+		t.Fatal("expected error for empty record in batch")
+	}
+}
+
+func TestAppendBatchMixedWithAppend(t *testing.T) {
+	path := "test_batch_mixed.wal"
+	defer os.Remove(path)
+
+	w, err := Open(path)
+	if err != nil {
+		t.Fatalf("open wal: %v", err)
+	}
+
+	// Write 5 individual records, then a batch of 10, then 5 more individual.
+	for i := 0; i < 5; i++ {
+		rs := makeTestResourceSpans("mixed-svc", fmt.Sprintf("single-%d", i))
+		data, _ := proto.Marshal(rs)
+		if err := w.Append(data); err != nil {
+			t.Fatalf("append %d: %v", i, err)
+		}
+	}
+
+	var batch [][]byte
+	for i := 0; i < 10; i++ {
+		rs := makeTestResourceSpans("mixed-svc", fmt.Sprintf("batch-%d", i))
+		data, _ := proto.Marshal(rs)
+		batch = append(batch, data)
+	}
+	if err := w.AppendBatch(batch); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		rs := makeTestResourceSpans("mixed-svc", fmt.Sprintf("single2-%d", i))
+		data, _ := proto.Marshal(rs)
+		if err := w.Append(data); err != nil {
+			t.Fatalf("append2 %d: %v", i, err)
+		}
+	}
+
+	_ = w.Sync()
+	_ = w.Close()
+
+	replayed, err := ReplayToSlice(path)
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if len(replayed) != 20 {
+		t.Fatalf("expected 20 records, got %d", len(replayed))
+	}
+}
+
 func TestWALCRC32BadCorruption(t *testing.T) {
 	path := "test_crc_bad.wal"
 	defer os.Remove(path)
@@ -286,6 +419,7 @@ func TestReplayFromOffset(t *testing.T) {
 		}
 	}
 	_ = w.Sync()
+	offset5 := w.Offset() // offset after all 10 records
 	_ = w.Close()
 
 	// Replay from offset 0 should return all 10.
@@ -298,6 +432,47 @@ func TestReplayFromOffset(t *testing.T) {
 	}
 	if count != 10 {
 		t.Fatalf("expected 10 records from offset 0, got %d", count)
+	}
+
+	// Replay from end offset should return 0 records.
+	count = 0
+	if err := ReplayFromOffset(nil, path, offset5, func(raw []byte, _ *tracepb.ResourceSpans) error {
+		count++
+		return nil
+	}); err != nil {
+		t.Fatalf("ReplayFromOffset from end: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected 0 records from end offset, got %d", count)
+	}
+}
+
+func TestReplayFromOffsetMissingFile(t *testing.T) {
+	// Missing file is a no-op (returns nil) — by design for replay on fresh start.
+	err := ReplayFromOffset(nil, "nonexistent.wal", 0, func(raw []byte, _ *tracepb.ResourceSpans) error {
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected nil for missing file, got: %v", err)
+	}
+}
+
+func TestNewReaderFromFileMissing(t *testing.T) {
+	_, err := NewReaderFromFile("nonexistent.wal")
+	if err == nil {
+		t.Fatal("expected error for nonexistent file")
+	}
+}
+
+func TestOpenStatError(t *testing.T) {
+	// Open a path that's a directory, not a file — triggers stat or open error.
+	dir, _ := os.MkdirTemp("", "wal-test-dir")
+	defer os.RemoveAll(dir)
+
+	// Trying to open a directory as append-only file should fail.
+	_, err := Open(dir)
+	if err == nil {
+		t.Fatal("expected error opening directory as WAL")
 	}
 }
 

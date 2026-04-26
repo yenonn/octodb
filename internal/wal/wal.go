@@ -38,6 +38,47 @@ func Open(path string) (*Writer, error) {
 	}, nil
 }
 
+// AppendBatch appends multiple records in one atomic write.
+// Format: [n records] where each record is [length][CRC32][payload].
+func (w *Writer) AppendBatch(batch [][]byte) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var total int
+	for _, data := range batch {
+		n := len(data)
+		if n == 0 {
+			return fmt.Errorf("wal: cannot append empty record in batch")
+		}
+		if n > 0x7FFFFFFF {
+			return fmt.Errorf("wal: record too large (%d bytes)", n)
+		}
+		total += 8 + n
+	}
+
+	buf := make([]byte, 0, total)
+	for _, data := range batch {
+		n := len(data)
+		recordLen := make([]byte, 4)
+		binary.BigEndian.PutUint32(recordLen, uint32(n))
+		buf = append(buf, recordLen...)
+		checksum := make([]byte, 4)
+		binary.BigEndian.PutUint32(checksum, crc32.ChecksumIEEE(data))
+		buf = append(buf, checksum...)
+		buf = append(buf, data...)
+	}
+
+	written, err := w.file.Write(buf)
+	if err != nil {
+		return fmt.Errorf("wal: batch write error: %w", err)
+	}
+	w.offset += int64(written)
+	return nil
+}
+
 // Append writes a length-prefixed record to the WAL.
 // Format: [4 bytes big-endian length][4 bytes CRC32][N bytes payload].
 func (w *Writer) Append(data []byte) error {

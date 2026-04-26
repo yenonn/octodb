@@ -28,14 +28,27 @@ import (
 )
 
 const (
-	MemtableFlushThreshold = 1024 // 1 KB — easy to trigger during testing
-	FlushPollInterval      = 1 * time.Second
-	DefaultRetention       = 7 * 24 * time.Hour // default segment retention for TTL
-	CompactionInterval     = 6 * time.Hour       // how often to trigger compaction
+	DefaultMemtableFlushThreshold = 64 * 1024 * 1024 // 64 MB — production default
+	TestMemtableFlushThreshold    = 1024              // 1 KB — easy to trigger during testing
+	FlushPollInterval             = 1 * time.Second
+	DefaultRetention              = 7 * 24 * time.Hour // default segment retention for TTL
+	CompactionInterval            = 6 * time.Hour      // how often to trigger compaction
 )
 
 // MemtableMaxIdleFlush is the maximum duration between flushes even if size threshold isn't met.
 const MemtableMaxIdleFlush = 30 * time.Second
+
+// StoreConfig holds tunable parameters for the block2 store.
+type StoreConfig struct {
+	MemtableFlushThreshold int64
+}
+
+// DefaultStoreConfig returns production defaults.
+func DefaultStoreConfig() StoreConfig {
+	return StoreConfig{
+		MemtableFlushThreshold: DefaultMemtableFlushThreshold,
+	}
+}
 
 // signalBundle holds everything for one signal type (traces or logs).
 type signalBundle struct {
@@ -53,6 +66,7 @@ type signalBundle struct {
 
 type block2Store struct {
 	dataDir string
+	cfg     StoreConfig
 
 	traceBundle  *signalBundle
 	logBundle    *signalBundle
@@ -62,9 +76,20 @@ type block2Store struct {
 	flushDone sync.WaitGroup
 }
 
+// NewBlock2Store creates a store with test-friendly defaults (1KB flush threshold).
 func NewBlock2Store(dataDir string) (Store, error) {
+	return NewBlock2StoreWithConfig(dataDir, StoreConfig{
+		MemtableFlushThreshold: TestMemtableFlushThreshold,
+	})
+}
+
+// NewBlock2StoreWithConfig creates a store with the given configuration.
+func NewBlock2StoreWithConfig(dataDir string, cfg StoreConfig) (Store, error) {
 	if dataDir == "" {
 		dataDir = "."
+	}
+	if cfg.MemtableFlushThreshold <= 0 {
+		cfg.MemtableFlushThreshold = DefaultMemtableFlushThreshold
 	}
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("block2: mkdir: %w", err)
@@ -72,6 +97,7 @@ func NewBlock2Store(dataDir string) (Store, error) {
 
 	s := &block2Store{
 		dataDir:   dataDir,
+		cfg:       cfg,
 		stopFlush: make(chan struct{}),
 	}
 
@@ -350,11 +376,11 @@ func (b *signalBundle) insert(key memtable.Key, value []byte) {
 	b.lastWrite = time.Now()
 }
 
-// flushIdleSize returns true if the bundle should be flushed based on idle timeout.
-func (b *signalBundle) flushIdleSize() int64 {
+// flushIdleSize returns the effective size for flush decisions.
+// If idle timeout has elapsed, returns the threshold to force a flush.
+func (b *signalBundle) flushIdleSize(threshold int64) int64 {
 	if time.Since(b.lastWrite) > MemtableMaxIdleFlush && b.set.ActiveSize() > 0 {
-		// treat as threshold met to force flush
-		return MemtableFlushThreshold
+		return threshold
 	}
 	return b.set.ActiveSize()
 }
@@ -364,20 +390,21 @@ func (b *signalBundle) flushIdleSize() int64 {
 // ---------------------------------------------------------------------------
 
 func (s *block2Store) WriteTraces(ctx context.Context, tenantID string, spans []*tracepb.ResourceSpans) error {
+	batch := make([][]byte, 0, len(spans))
 	for _, rs := range spans {
 		data, err := proto.Marshal(rs)
 		if err != nil {
 			return err
 		}
-		if err := s.traceBundle.wal.Append(data); err != nil {
-			return err
-		}
+		batch = append(batch, data)
+	}
+	if err := s.traceBundle.wal.AppendBatch(batch); err != nil {
+		return err
 	}
 	if err := s.traceBundle.wal.Sync(); err != nil {
 		return err
 	}
-	for _, rs := range spans {
-		data, _ := proto.Marshal(rs)
+	for _, data := range batch {
 		key, data2 := s.extractTraceSortKey(data)
 		s.traceBundle.insert(key, data2)
 	}
@@ -564,20 +591,21 @@ func (s *block2Store) ReadTraceByID(ctx context.Context, tenantID, traceID strin
 // ---------------------------------------------------------------------------
 
 func (s *block2Store) WriteLogs(ctx context.Context, tenantID string, logs []*logspb.ResourceLogs) error {
+	batch := make([][]byte, 0, len(logs))
 	for _, rl := range logs {
 		data, err := proto.Marshal(rl)
 		if err != nil {
 			return err
 		}
-		if err := s.logBundle.wal.Append(data); err != nil {
-			return err
-		}
+		batch = append(batch, data)
+	}
+	if err := s.logBundle.wal.AppendBatch(batch); err != nil {
+		return err
 	}
 	if err := s.logBundle.wal.Sync(); err != nil {
 		return err
 	}
-	for _, rl := range logs {
-		data, _ := proto.Marshal(rl)
+	for _, data := range batch {
 		key, data2 := s.extractLogSortKey(data)
 		s.logBundle.insert(key, data2)
 	}
@@ -758,13 +786,14 @@ func (s *block2Store) flushMonitor() {
 			}
 			return
 		case <-ticker.C:
-			if s.traceBundle.flushIdleSize() >= MemtableFlushThreshold {
+			thresh := s.cfg.MemtableFlushThreshold
+			if s.traceBundle.flushIdleSize(thresh) >= thresh {
 				_ = s.flushBundle(s.traceBundle)
 			}
-			if s.logBundle.flushIdleSize() >= MemtableFlushThreshold {
+			if s.logBundle.flushIdleSize(thresh) >= thresh {
 				_ = s.flushBundle(s.logBundle)
 			}
-			if s.metricBundle.flushIdleSize() >= MemtableFlushThreshold {
+			if s.metricBundle.flushIdleSize(thresh) >= thresh {
 				_ = s.flushBundle(s.metricBundle)
 			}
 		}
@@ -1137,20 +1166,21 @@ func (s *block2Store) flushBundle(b *signalBundle) error {
 
 
 func (s *block2Store) WriteMetrics(ctx context.Context, tenantID string, metrics []*metricspb.ResourceMetrics) error {
+	batch := make([][]byte, 0, len(metrics))
 	for _, rm := range metrics {
 		data, err := proto.Marshal(rm)
 		if err != nil {
 			return err
 		}
-		if err := s.metricBundle.wal.Append(data); err != nil {
-			return err
-		}
+		batch = append(batch, data)
+	}
+	if err := s.metricBundle.wal.AppendBatch(batch); err != nil {
+		return err
 	}
 	if err := s.metricBundle.wal.Sync(); err != nil {
 		return err
 	}
-	for _, rm := range metrics {
-		data, _ := proto.Marshal(rm)
+	for _, data := range batch {
 		key, data2 := s.extractMetricSortKey(data)
 		s.metricBundle.insert(key, data2)
 	}

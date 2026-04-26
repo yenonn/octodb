@@ -31,8 +31,8 @@ func main() {
 		dataDir = "octodb-data"
 	}
 
-	// Block 2: Use Block2Store (WAL + memtable + flush)
-	st, err := store.NewBlock2Store(dataDir)
+	// Block 2: Use Block2Store (WAL + memtable + flush) with production config.
+	st, err := store.NewBlock2StoreWithConfig(dataDir, store.DefaultStoreConfig())
 	if err != nil {
 		log.Fatalf("failed to open Block 2 store: %v", err)
 	}

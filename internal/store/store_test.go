@@ -14,6 +14,9 @@ import (
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
+
+	"github.com/octodb/octodb/internal/manifest"
+	"github.com/octodb/octodb/internal/memtable"
 )
 
 func setupTestStore(t *testing.T) (Store, string) {
@@ -869,3 +872,247 @@ func TestCompactionMergesSegments(t *testing.T) {
 		t.Fatal("expected at least 1 .pb file after compaction")
 	}
 }
+
+// TestDeleteLogs verifies log tombstones work.
+func TestDeleteLogs(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+	lg := makeTestLog("del-log-svc", "delete-me", logspb.SeverityNumber_SEVERITY_NUMBER_ERROR, nil, nil, now)
+	_ = st.WriteLogs(ctx, "default", []*logspb.ResourceLogs{lg})
+
+	logs, _ := st.ReadLogs(ctx, LogReadRequest{TenantID: "default", Service: "del-log-svc"})
+	if len(logs) != 1 {
+		t.Fatalf("expected 1 log before delete, got %d", len(logs))
+	}
+
+	_ = st.DeleteLogs(ctx, "default", LogReadRequest{TenantID: "default", Service: "del-log-svc"})
+
+	logs, _ = st.ReadLogs(ctx, LogReadRequest{TenantID: "default", Service: "del-log-svc"})
+	if len(logs) != 0 {
+		t.Fatalf("expected 0 logs after delete, got %d", len(logs))
+	}
+}
+
+// TestDeleteMetrics verifies metric tombstones work.
+func TestDeleteMetrics(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+	m := makeTestMetric("del-metric-svc", "cpu.usage", 99.9, now)
+	_ = st.WriteMetrics(ctx, "default", []*metricspb.ResourceMetrics{m})
+
+	metrics, _ := st.ReadMetrics(ctx, MetricReadRequest{TenantID: "default", Service: "del-metric-svc"})
+	if len(metrics) != 1 {
+		t.Fatalf("expected 1 metric before delete, got %d", len(metrics))
+	}
+
+	_ = st.DeleteMetrics(ctx, "default", MetricReadRequest{TenantID: "default", Service: "del-metric-svc"})
+
+	metrics, _ = st.ReadMetrics(ctx, MetricReadRequest{TenantID: "default", Service: "del-metric-svc"})
+	if len(metrics) != 0 {
+		t.Fatalf("expected 0 metrics after delete, got %d", len(metrics))
+	}
+}
+
+// TestDefaultStoreConfig verifies the production default config.
+func TestDefaultStoreConfig(t *testing.T) {
+	cfg := DefaultStoreConfig()
+	if cfg.MemtableFlushThreshold != DefaultMemtableFlushThreshold {
+		t.Fatalf("expected %d, got %d", DefaultMemtableFlushThreshold, cfg.MemtableFlushThreshold)
+	}
+}
+
+// TestNewBlock2StoreWithConfig verifies custom config is applied.
+func TestNewBlock2StoreWithConfig(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	cfg := StoreConfig{MemtableFlushThreshold: 2048}
+	st, err := NewBlock2StoreWithConfig(dataDir, cfg)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	s := st.(*block2Store)
+	if s.cfg.MemtableFlushThreshold != 2048 {
+		t.Fatalf("expected threshold 2048, got %d", s.cfg.MemtableFlushThreshold)
+	}
+}
+
+// TestNewBlock2StoreWithConfigZeroThreshold verifies zero defaults to production.
+func TestNewBlock2StoreWithConfigZeroThreshold(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	st, err := NewBlock2StoreWithConfig(dataDir, StoreConfig{})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	s := st.(*block2Store)
+	if s.cfg.MemtableFlushThreshold != DefaultMemtableFlushThreshold {
+		t.Fatalf("expected default threshold %d, got %d", DefaultMemtableFlushThreshold, s.cfg.MemtableFlushThreshold)
+	}
+}
+
+// TestWriteTracesEmptyBatch verifies empty batch is a no-op.
+func TestWriteTracesEmptyBatch(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	err := st.WriteTraces(context.Background(), "default", nil)
+	if err != nil {
+		t.Fatalf("WriteTraces(nil): %v", err)
+	}
+	err = st.WriteTraces(context.Background(), "default", []*tracepb.ResourceSpans{})
+	if err != nil {
+		t.Fatalf("WriteTraces(empty): %v", err)
+	}
+}
+
+// TestWriteLogsEmptyBatch verifies empty batch is a no-op.
+func TestWriteLogsEmptyBatch(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	err := st.WriteLogs(context.Background(), "default", nil)
+	if err != nil {
+		t.Fatalf("WriteLogs(nil): %v", err)
+	}
+}
+
+// TestWriteMetricsEmptyBatch verifies empty batch is a no-op.
+func TestWriteMetricsEmptyBatch(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	err := st.WriteMetrics(context.Background(), "default", nil)
+	if err != nil {
+		t.Fatalf("WriteMetrics(nil): %v", err)
+	}
+}
+
+// TestSweepBundleTTLNilSafe verifies sweepBundleTTL doesn't panic on nil bundle.
+func TestSweepBundleTTLNilSafe(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+	s := st.(*block2Store)
+	s.sweepBundleTTL(nil) // should not panic
+}
+
+// TestSweepBundleTTLWithExpiredSegments verifies sweep removes old segments.
+func TestSweepBundleTTLWithExpiredSegments(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	st, err := NewBlock2Store(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 15; i++ {
+		span := makeTestTrace("sweep-svc", fmt.Sprintf("span-%d", i), now+uint64(i)*1e6)
+		_ = st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span})
+	}
+	_ = st.Close()
+
+	// Reopen. Rewrite manifest records with old CreatedAt via CompactRecords.
+	st2, err := NewBlock2Store(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st2.Close()
+
+	s := st2.(*block2Store)
+	records := s.traceBundle.man.AllRecords()
+	if len(records) == 0 {
+		t.Fatal("expected segments before sweep")
+	}
+
+	// Replace all records with copies that have CreatedAt=1 (very old).
+	var oldSeqs []int64
+	var newRecs []manifest.Record
+	for _, rec := range records {
+		oldSeqs = append(oldSeqs, rec.Sequence)
+		rec.CreatedAt = 1
+		newRecs = append(newRecs, rec)
+	}
+	_ = s.traceBundle.man.CompactRecords(oldSeqs, newRecs)
+
+	s.traceBundle.retention = time.Nanosecond
+	s.sweepBundleTTL(s.traceBundle)
+
+	afterRecords := len(s.traceBundle.man.AllRecords())
+	if afterRecords >= len(records) {
+		t.Fatalf("expected fewer records after sweep, before=%d after=%d", len(records), afterRecords)
+	}
+}
+
+// TestFlushIdleSize verifies idle timeout forces flush.
+func TestFlushIdleSize(t *testing.T) {
+	bundle := &signalBundle{
+		set:       memtable.NewSet(),
+		lastWrite: time.Now().Add(-2 * MemtableMaxIdleFlush), // long ago
+	}
+	// Insert something so ActiveSize > 0.
+	bundle.set.Insert(memtable.Key{Key: "test"}, []byte("data"))
+
+	threshold := int64(1024)
+	result := bundle.flushIdleSize(threshold)
+	if result != threshold {
+		t.Fatalf("expected idle size to return threshold %d, got %d", threshold, result)
+	}
+
+	// Recent write: should return actual size.
+	bundle.lastWrite = time.Now()
+	result = bundle.flushIdleSize(threshold)
+	if result == threshold {
+		t.Fatal("expected actual size, not threshold, for recent write")
+	}
+}
+
+// TestReadTraceByIDNotFound verifies empty result for missing trace.
+func TestReadTraceByIDNotFound(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	result, err := st.ReadTraceByID(context.Background(), "default", "nonexistent")
+	if err != nil {
+		t.Fatalf("ReadTraceByID: %v", err)
+	}
+	if len(result) != 0 {
+		t.Fatalf("expected 0 spans for nonexistent trace, got %d", len(result))
+	}
+}
+
+// TestTraceIDFilter verifies trace_id filtering in ReadTraces.
+func TestTraceIDFilterInReadTraces(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+	span := makeTestTrace("tid-svc", "tid-span", now)
+	_ = st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span})
+
+	traceID := hex.EncodeToString([]byte("1234567890abcdef1234567890abcdef"))
+	result, _ := st.ReadTraces(ctx, TraceReadRequest{TenantID: "default", TraceID: traceID})
+	if len(result) != 1 {
+		t.Fatalf("expected 1 span matching trace_id, got %d", len(result))
+	}
+
+	result, _ = st.ReadTraces(ctx, TraceReadRequest{TenantID: "default", TraceID: "nonexistent"})
+	if len(result) != 0 {
+		t.Fatalf("expected 0 spans for wrong trace_id, got %d", len(result))
+	}
+}
+
