@@ -386,14 +386,17 @@ func (s *block2Store) ReadTraces(ctx context.Context, req TraceReadRequest) ([]*
 		if req.Service != "" && rec.MinKey.Service != req.Service && rec.MaxKey.Service != req.Service {
 			continue
 		}
-		if uint64(req.EndTime) <= rec.MinKey.TimeNano || uint64(req.StartTime) >= rec.MaxKey.TimeNano {
+		if req.EndTime > 0 && uint64(req.EndTime) <= rec.MinKey.TimeNano {
+			continue
+		}
+		if req.StartTime > 0 && uint64(req.StartTime) >= rec.MaxKey.TimeNano {
 			continue
 		}
 		if req.Service != "" && rec.BloomFile != "" {
 			bloomPath := filepath.Join(s.dataDir, s.traceBundle.subdir, rec.BloomFile)
 			if bf, err := bloom.Load(bloomPath); err == nil {
-				target := otelutil.TraceSortKey{TenantID: req.TenantID, Service: req.Service, TimeNano: 0, SpanID: "0000000000000000"}
-				if !bf.MightContain(target.Key()) {
+				target := req.TenantID + "\x00" + req.Service
+				if !bf.MightContain(target) {
 					continue
 				}
 			}
@@ -583,14 +586,17 @@ func (s *block2Store) ReadLogs(ctx context.Context, req LogReadRequest) ([]*logs
 		if req.Service != "" && rec.MinKey.Service != req.Service && rec.MaxKey.Service != req.Service {
 			continue
 		}
-		if uint64(req.EndTime) <= rec.MinKey.TimeNano || uint64(req.StartTime) >= rec.MaxKey.TimeNano {
+		if req.EndTime > 0 && uint64(req.EndTime) <= rec.MinKey.TimeNano {
+			continue
+		}
+		if req.StartTime > 0 && uint64(req.StartTime) >= rec.MaxKey.TimeNano {
 			continue
 		}
 		if req.Service != "" && rec.BloomFile != "" {
 			bloomPath := filepath.Join(s.dataDir, s.logBundle.subdir, rec.BloomFile)
 			if bf, err := bloom.Load(bloomPath); err == nil {
-				target := otelutil.LogSortKey{TenantID: req.TenantID, Service: req.Service, TimeNano: 0}
-				if !bf.MightContain(target.Key()) {
+				target := req.TenantID + "\x00" + req.Service
+				if !bf.MightContain(target) {
 					continue
 				}
 			}
@@ -787,7 +793,7 @@ func (s *block2Store) flushBundle(b *signalBundle) error {
 				maxKey = mk
 			}
 		}
-		bloomKeys = append(bloomKeys, key.Key)
+		bloomKeys = append(bloomKeys, extractServiceBloomKey(key.Key))
 		lastSortKey = key.Key
 		return true
 	})
@@ -898,14 +904,17 @@ func (s *block2Store) ReadMetrics(ctx context.Context, req MetricReadRequest) ([
 		if req.Service != "" && rec.MinKey.Service != req.Service && rec.MaxKey.Service != req.Service {
 			continue
 		}
-		if uint64(req.EndTime) <= rec.MinKey.TimeNano || uint64(req.StartTime) >= rec.MaxKey.TimeNano {
+		if req.EndTime > 0 && uint64(req.EndTime) <= rec.MinKey.TimeNano {
+			continue
+		}
+		if req.StartTime > 0 && uint64(req.StartTime) >= rec.MaxKey.TimeNano {
 			continue
 		}
 		if req.Service != "" && rec.BloomFile != "" {
 			bloomPath := filepath.Join(s.dataDir, s.metricBundle.subdir, rec.BloomFile)
 			if bf, err := bloom.Load(bloomPath); err == nil {
-				target := otelutil.MetricSortKey{TenantID: req.TenantID, Service: req.Service, MetricName: req.MetricName, TimeNano: 0}
-				if !bf.MightContain(target.Key()) {
+				target := req.TenantID + "\x00" + req.Service
+				if !bf.MightContain(target) {
 					continue
 				}
 			}
@@ -940,6 +949,29 @@ func (s *block2Store) ReadMetrics(ctx context.Context, req MetricReadRequest) ([
 	}
 
 	return result, nil
+}
+
+func extractServiceBloomKey(sortKey string) string {
+	parts := splitNul(sortKey)
+	if len(parts) < 2 {
+		return sortKey
+	}
+	return parts[0] + "\x00" + parts[1]
+}
+
+func splitNul(s string) []string {
+	var out []string
+	start := 0
+	for i, b := range s {
+		if b == 0 {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		out = append(out, s[start:])
+	}
+	return out
 }
 
 func (s *block2Store) metricKeyMatches(rm metricspb.ResourceMetrics, req MetricReadRequest) bool {

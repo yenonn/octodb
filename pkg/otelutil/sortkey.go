@@ -1,7 +1,10 @@
 // Package otelutil provides helpers for working with OTel data structures and sort keys.
 package otelutil
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // DataType identifies the OTel signal type.
 type DataType string
@@ -64,16 +67,21 @@ type GenericSortKey struct {
 // TraceFromGeneric reconstructs a TraceSortKey from its string representation.
 // Not used in hot paths (mostly debug / tests).
 func TraceFromGeneric(key string) TraceSortKey {
-	var k TraceSortKey
-	fmt.Sscanf(key, "%s\x00%s\x00%016x\x00%s", &k.TenantID, &k.Service, &k.TimeNano, &k.SpanID)
+	parts := strings.Split(key, "\x00")
+	k := TraceSortKey{TenantID: parts[0], Service: parts[1], SpanID: parts[3]}
+	if len(parts) > 2 {
+		fmt.Sscanf(parts[2], "%016x", &k.TimeNano)
+	}
 	return k
 }
 
 // LogFromGeneric reconstructs a LogSortKey from its string representation.
 func LogFromGeneric(key string) LogSortKey {
-	var k LogSortKey
-	fmt.Sscanf(key, "%s\x00%s\x00%016x\x00%s\x00%s",
-		&k.TenantID, &k.Service, &k.TimeNano, &k.TraceID, &k.LogID)
+	parts := strings.Split(key, "\x00")
+	k := LogSortKey{TenantID: parts[0], Service: parts[1], TraceID: parts[3], LogID: parts[4]}
+	if len(parts) > 2 {
+		fmt.Sscanf(parts[2], "%016x", &k.TimeNano)
+	}
 	return k
 }
 
