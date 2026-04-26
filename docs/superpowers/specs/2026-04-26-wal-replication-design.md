@@ -239,6 +239,81 @@ func BenchmarkReplicatedWrites(b *testing.B) {
 3. **TestFailover** — Verify client fails over on leader crash
 4. **TestRecover** — Verify state recovers after restart
 
+## Replica Recovery
+
+Replicas can automatically recover after failure!
+
+### Failure Timeline
+
+```
+[Leader] ──writes──→ [Follower A] ──writes──→ [Follower B]
+    │                           │                     │
+    │                           │ fail                │
+    │                           │                     │
+    └───────────────────────────┴─────────────────────
+                    Continue with 2 nodes
+                     (quorum: 2/2 = 100%)
+```
+
+### When Replica Fails
+
+| Failure | Quorum | Outcome |
+|---------|-------|---------|
+| 1 of 3 followers fail | 2/3 | ✅ Continues |
+| 2 of 3 fail | 1/3 | ⚠️ Read-only |
+| Leader fails | 2/3 | ⚠️ New election |
+| All fail | 0/3 | ❌ Unavailable |
+
+### Recovery Process
+
+```
+[Follower B] rejoins after failure:
+    │
+    ▼
+[Leader] ──→ snapshot + WAL replay ──→ [Follower B] synced
+                 │
+              State transfer (background)
+```
+
+### Data Loss on Failures
+
+| Scenario | Data Lost |
+|----------|-----------|
+| Follower fails (1) | 0 bytes (replicated) |
+| Follower rejoin | 0 bytes (replayed) |
+| Leader fails | 0 bytes (Raft log) |
+| All fail | All (complete outage) |
+
+### Automatic Recovery (Raft Handles)
+
+```go
+// Raft automatically:
+// 1. Heartbeat monitoring (every 100ms)
+// 2. Vote election (on leader failure)  
+// 3. State transfer (on rejoin)
+// 4. Log rebuild (from leader snapshot)
+```
+
+### Add/Remove Replicas
+
+```bash
+# Add new follower
+raftctl add-node node4
+# → State transfer to new node
+# → New quorum: 3/4
+
+# Remove failed node  
+raftctl remove-node node3
+# → New quorum: 2/3
+```
+
+### Implementation Checklist
+
+1. **Heartbeat goroutine** — Monitor node health
+2. **State transfer** — Send snapshot + WAL on rejoin
+3. **Log compaction** — Prevent unbounded log growth
+4. **Node membership** — Add/remove nodes dynamically
+
 ## Read Scaling (Bonus)
 
 Replication enables read scaling across followers!
