@@ -10,6 +10,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,7 +55,8 @@ func DefaultStoreConfig() StoreConfig {
 
 // signalBundle holds everything for one signal type (traces or logs).
 type signalBundle struct {
-	walPath    string
+	walDir     string                          // directory containing numbered WAL files
+	walSeq     int64                           // current WAL file sequence number
 	wal        *wal.Writer
 	subdir     string                          // subdirectory under dataDir, e.g. "traces" / "logs"
 	man        *manifest.Manager               // per-signal manifest
@@ -62,6 +66,16 @@ type signalBundle struct {
 	lastWrite  time.Time                       // last time data was written to memtable
 	retention  time.Duration                  // TTL for this signal type (default = 7 days)
 	compactInterval time.Duration             // compaction ticker interval
+}
+
+// walPath returns the active WAL file path.
+func (b *signalBundle) walPath() string {
+	return filepath.Join(b.walDir, fmt.Sprintf("%06d.wal", b.walSeq))
+}
+
+// walFileName returns the active WAL file name (without directory).
+func (b *signalBundle) walFileName() string {
+	return fmt.Sprintf("%06d.wal", b.walSeq)
 }
 
 type block2Store struct {
@@ -102,21 +116,21 @@ func NewBlock2StoreWithConfig(dataDir string, cfg StoreConfig) (Store, error) {
 	}
 
 	// --- Trace bundle ---
-	tb, err := s.createBundle("traces", "traces.wal")
+	tb, err := s.createBundle("traces")
 	if err != nil {
 		return nil, fmt.Errorf("block2: trace bundle: %w", err)
 	}
 	s.traceBundle = tb
 
 	// --- Log bundle ---
-	lb, err := s.createBundle("logs", "logs.wal")
+	lb, err := s.createBundle("logs")
 	if err != nil {
 		return nil, fmt.Errorf("block2: log bundle: %w", err)
 	}
 	s.logBundle = lb
 
 	// --- Metric bundle ---
-	mb, err := s.createBundle("metrics", "metrics.wal")
+	mb, err := s.createBundle("metrics")
 	if err != nil {
 		return nil, fmt.Errorf("block2: metric bundle: %w", err)
 	}
@@ -177,12 +191,19 @@ func NewBlock2StoreWithConfig(dataDir string, cfg StoreConfig) (Store, error) {
 	return s, nil
 }
 
-func (s *block2Store) createBundle(subdir, walBase string) (*signalBundle, error) {
+func (s *block2Store) createBundle(subdir string) (*signalBundle, error) {
 	dir := filepath.Join(s.dataDir, subdir)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
 	}
-	walPath := filepath.Join(dir, walBase)
+
+	// Find the highest-numbered WAL file in the directory.
+	walSeq := highestWALSeq(dir)
+	if walSeq == 0 {
+		walSeq = 1 // start from 000001.wal
+	}
+
+	walPath := filepath.Join(dir, fmt.Sprintf("%06d.wal", walSeq))
 	w, err := wal.Open(walPath)
 	if err != nil {
 		return nil, fmt.Errorf("wal open %s: %w", walPath, err)
@@ -193,7 +214,8 @@ func (s *block2Store) createBundle(subdir, walBase string) (*signalBundle, error
 		return nil, fmt.Errorf("manifest open %s: %w", dir, err)
 	}
 	return &signalBundle{
-		walPath:         walPath,
+		walDir:          dir,
+		walSeq:          walSeq,
 		wal:             w,
 		subdir:          subdir,
 		man:             m,
@@ -202,6 +224,32 @@ func (s *block2Store) createBundle(subdir, walBase string) (*signalBundle, error
 		retention:       DefaultRetention,
 		compactInterval: CompactionInterval,
 	}, nil
+}
+
+// highestWALSeq scans a directory for *.wal files (not .tombstone) and returns
+// the highest sequence number found, or 0 if none exist.
+func highestWALSeq(dir string) int64 {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0
+	}
+	var maxSeq int64
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".wal") || strings.HasSuffix(name, ".tombstone") {
+			continue
+		}
+		// Parse "000003.wal" → 3
+		base := strings.TrimSuffix(name, ".wal")
+		seq, err := strconv.ParseInt(base, 10, 64)
+		if err != nil {
+			continue
+		}
+		if seq > maxSeq {
+			maxSeq = seq
+		}
+	}
+	return maxSeq
 }
 
 func (s *block2Store) rebuildLocator(b *signalBundle) error {
@@ -217,13 +265,98 @@ func (s *block2Store) rebuildLocator(b *signalBundle) error {
 }
 
 func (s *block2Store) replayBundle(b *signalBundle, fn func(raw []byte)) error {
-	if _, err := os.Stat(b.walPath); os.IsNotExist(err) {
+	// Read checkpoint to know where to start replay.
+	cp, err := b.man.ReadCheckpoint()
+	if err != nil {
+		return fmt.Errorf("replay: read checkpoint: %w", err)
+	}
+
+	// Find all non-tombstoned WAL files, sorted by sequence.
+	walFiles := listWALFiles(b.walDir)
+	if len(walFiles) == 0 {
 		return nil
 	}
-	return wal.ReplayBytes(b.walPath, func(raw []byte) error {
-		fn(raw)
+
+	for _, wf := range walFiles {
+		walPath := filepath.Join(b.walDir, wf.name)
+
+		var startOffset int64
+		if cp.File != "" && wf.name == cp.File {
+			startOffset = cp.Offset
+		} else if cp.File != "" && wf.seq < walSeqFromName(cp.File) {
+			// This WAL file is before the checkpoint — skip entirely.
+			continue
+		}
+
+		if err := replayWALFile(walPath, startOffset, fn); err != nil {
+			return fmt.Errorf("replay %s: %w", wf.name, err)
+		}
+	}
+	return nil
+}
+
+type walFileInfo struct {
+	name string
+	seq  int64
+}
+
+// listWALFiles returns all non-tombstoned .wal files sorted by sequence.
+func listWALFiles(dir string) []walFileInfo {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
 		return nil
-	})
+	}
+	var files []walFileInfo
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".wal") || strings.HasSuffix(name, ".tombstone") {
+			continue
+		}
+		seq := walSeqFromName(name)
+		if seq > 0 {
+			files = append(files, walFileInfo{name: name, seq: seq})
+		}
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].seq < files[j].seq })
+	return files
+}
+
+// walSeqFromName parses "000003.wal" → 3.
+func walSeqFromName(name string) int64 {
+	base := strings.TrimSuffix(name, ".wal")
+	seq, err := strconv.ParseInt(base, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return seq
+}
+
+// replayWALFile replays a single WAL file from the given offset.
+func replayWALFile(path string, offset int64, fn func(raw []byte)) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	if offset > 0 {
+		if _, err := f.Seek(offset, 0); err != nil {
+			return fmt.Errorf("seek to %d: %w", offset, err)
+		}
+	}
+
+	r := wal.NewReader(f)
+	for {
+		data, err := r.Next()
+		if err != nil {
+			break // EOF or truncated record — done with this file
+		}
+		fn(data)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +960,9 @@ func (s *block2Store) ttlAndCompactionSweep() {
 			_ = s.compactBundle(s.traceBundle)
 			_ = s.compactBundle(s.logBundle)
 			_ = s.compactBundle(s.metricBundle)
+			s.cleanupWALTombstones(s.traceBundle)
+			s.cleanupWALTombstones(s.logBundle)
+			s.cleanupWALTombstones(s.metricBundle)
 		}
 	}
 }
@@ -944,6 +1080,17 @@ func (s *block2Store) sweepBundleTTL(b *signalBundle) {
 			}
 			return true
 		})
+	}
+}
+
+// cleanupWALTombstones deletes flushed WAL files marked with .tombstone suffix.
+func (s *block2Store) cleanupWALTombstones(b *signalBundle) {
+	if b == nil {
+		return
+	}
+	matches, _ := filepath.Glob(filepath.Join(b.walDir, "*.wal.tombstone"))
+	for _, m := range matches {
+		_ = os.Remove(m)
 	}
 }
 
@@ -1131,7 +1278,7 @@ func (s *block2Store) flushBundle(b *signalBundle) error {
 		return fmt.Errorf("flush: save bloom: %w", err)
 	}
 
-	walName := filepath.Base(b.walPath)
+	walName := b.walFileName()
 	offset := b.wal.Offset()
 
 	rec := manifest.Record{
@@ -1149,13 +1296,17 @@ func (s *block2Store) flushBundle(b *signalBundle) error {
 		return fmt.Errorf("flush: manifest: %w", err)
 	}
 
-	if err := b.man.WriteCheckpoint(walName, offset); err != nil {
+	// Write checkpoint pointing to the NEXT WAL file (post-rotation).
+	nextWALName := fmt.Sprintf("%06d.wal", b.walSeq+1)
+	if err := b.man.WriteCheckpoint(nextWALName, 0); err != nil {
 		return fmt.Errorf("flush: checkpoint: %w", err)
 	}
 
+	// Rotate WAL: close current, mark as tombstone, open next.
 	_ = b.wal.Close()
-	_ = os.Truncate(b.walPath, 0)
-	w, err := wal.Open(b.walPath)
+	_ = os.Rename(b.walPath(), b.walPath()+".tombstone")
+	b.walSeq++
+	w, err := wal.Open(b.walPath())
 	if err != nil {
 		return fmt.Errorf("flush: reopen wal: %w", err)
 	}

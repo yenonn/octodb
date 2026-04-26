@@ -59,7 +59,7 @@ func TestBlock2_FlushAndQuery(t *testing.T) {
 		t.Logf("segment file: %s (size %d)", seg, fileSize(t, seg))
 	}
 
-	walPath := filepath.Join(traceDir, "traces.wal")
+	walPath := filepath.Join(traceDir, "000001.wal")
 	walInfo, _ := os.Stat(walPath)
 	if walInfo != nil {
 		t.Logf("wal size after flush: %d", walInfo.Size())

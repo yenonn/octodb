@@ -32,7 +32,11 @@ func main() {
 	}
 
 	// Block 2: Use Block2Store (WAL + memtable + flush) with production config.
-	st, err := store.NewBlock2StoreWithConfig(dataDir, store.DefaultStoreConfig())
+	storeCfg := store.DefaultStoreConfig()
+	if cfg.Server.MemtableFlushThreshold > 0 {
+		storeCfg.MemtableFlushThreshold = cfg.Server.MemtableFlushThreshold
+	}
+	st, err := store.NewBlock2StoreWithConfig(dataDir, storeCfg)
 	if err != nil {
 		log.Fatalf("failed to open Block 2 store: %v", err)
 	}

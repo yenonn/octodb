@@ -55,6 +55,7 @@ func startServer(tb testing.TB, bin string, dataDir string) *exec.Cmd {
 	cmd.Env = append(os.Environ(),
 		"OCTODB_GRPC_ADDR=:4317",
 		"OCTODB_DATA_DIR="+dataDir,
+		"OCTODB_MEMTABLE_FLUSH_THRESHOLD=1024", // 1KB for fast flush in tests
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -88,7 +89,7 @@ func TestBlock1_WALCrashRecovery(t *testing.T) {
 	sendExport(t, dataDir, buildTestResourceSpans("integration-test-svc", "test-span"))
 
 	// --- Step 3: Verify WAL has bytes ---
-	walPath := filepath.Join(dataDir, "traces", "traces.wal")
+	walPath := filepath.Join(dataDir, "traces", "000001.wal")
 	info, err := os.Stat(walPath)
 	if err != nil {
 		t.Fatalf("wal stat: %v", err)

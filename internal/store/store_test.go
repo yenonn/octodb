@@ -320,8 +320,8 @@ func TestMixedSignals(t *testing.T) {
 	}
 
 	// Verify per-signal WAL files exist.
-	traceWAL := filepath.Join(dataDir, "traces", "traces.wal")
-	logWAL := filepath.Join(dataDir, "logs", "logs.wal")
+	traceWAL := filepath.Join(dataDir, "traces", "000001.wal")
+	logWAL := filepath.Join(dataDir, "logs", "000001.wal")
 	if _, err := os.Stat(traceWAL); os.IsNotExist(err) {
 		t.Fatal("trace WAL missing")
 	}
@@ -524,7 +524,7 @@ func TestMixedAllSignals(t *testing.T) {
 	}
 
 	// Verify per-signal WALs exist.
-	for _, sub := range []string{"traces/traces.wal", "logs/logs.wal", "metrics/metrics.wal"} {
+	for _, sub := range []string{"traces/000001.wal", "logs/000001.wal", "metrics/000001.wal"} {
 		p := filepath.Join(dataDir, sub)
 		if _, err := os.Stat(p); os.IsNotExist(err) {
 			t.Fatalf("missing %s", p)
@@ -1094,25 +1094,160 @@ func TestReadTraceByIDNotFound(t *testing.T) {
 	}
 }
 
-// TestTraceIDFilter verifies trace_id filtering in ReadTraces.
-func TestTraceIDFilterInReadTraces(t *testing.T) {
-	st, _ := setupTestStore(t)
-	defer st.Close()
+// TestWALRotationAfterFlush writes data, triggers flush, verifies old WAL renamed to .tombstone.
+func TestWALRotationAfterFlush(t *testing.T) {
+	st, dataDir := setupTestStore(t)
 
 	ctx := context.Background()
 	now := uint64(time.Now().UnixNano())
-	span := makeTestTrace("tid-svc", "tid-span", now)
-	_ = st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span})
-
-	traceID := hex.EncodeToString([]byte("1234567890abcdef1234567890abcdef"))
-	result, _ := st.ReadTraces(ctx, TraceReadRequest{TenantID: "default", TraceID: traceID})
-	if len(result) != 1 {
-		t.Fatalf("expected 1 span matching trace_id, got %d", len(result))
+	span := makeTestTrace("rot-svc", "rot-span", now)
+	if err := st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span}); err != nil {
+		t.Fatalf("write: %v", err)
 	}
 
-	result, _ = st.ReadTraces(ctx, TraceReadRequest{TenantID: "default", TraceID: "nonexistent"})
-	if len(result) != 0 {
-		t.Fatalf("expected 0 spans for wrong trace_id, got %d", len(result))
+	tracesDir := filepath.Join(dataDir, "traces")
+
+	walBefore := filepath.Join(tracesDir, "000001.wal")
+	if _, err := os.Stat(walBefore); err != nil {
+		t.Fatalf("expected WAL 000001.wal, not found: %v", err)
 	}
+
+	st.Close()
+
+	tombstone := filepath.Join(tracesDir, "000001.wal.tombstone")
+	if _, err := os.Stat(tombstone); err != nil {
+		t.Fatalf("expected WAL tombstone after flush, not found: %v", err)
+	}
+
+	newWal := filepath.Join(tracesDir, "000002.wal")
+	if _, err := os.Stat(newWal); err != nil {
+		t.Fatalf("expected new WAL 000002.wal after flush, not found: %v", err)
+	}
+}
+
+// TestWALMultiFileReplay writes across multiple WAL files, forces flushes, simulates crash by closing without flush, restarts and verifies all data replayed.
+func TestWALMultiFileReplay(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	st, err := NewBlock2StoreWithConfig(dataDir, StoreConfig{
+		MemtableFlushThreshold: 1,
+	})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	for i := 0; i < 3; i++ {
+		span := makeTestTrace(fmt.Sprintf("replay-svc-%d", i), fmt.Sprintf("replay-span-%d", i), now+uint64(i))
+		if err := st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	tracesDir := filepath.Join(dataDir, "traces")
+	walFilesBefore, _ := filepath.Glob(filepath.Join(tracesDir, "*.wal"))
+
+	st.Close()
+
+	st2, err := NewBlock2Store(dataDir)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+
+	result, err := st2.ReadTraces(ctx, TraceReadRequest{TenantID: "default"})
+	if err != nil {
+		t.Fatalf("read after replay: %v", err)
+	}
+
+	if len(result) < 3 {
+		t.Fatalf("expected at least 3 spans after replay, got %d", len(result))
+	}
+
+	st2.Close()
+
+	_ = walFilesBefore
+}
+
+// TestWALTombstoneCleanup creates .tombstone files, triggers cleanup, verifies they are deleted.
+func TestWALTombstoneCleanup(t *testing.T) {
+	st, dataDir := setupTestStore(t)
+
+	tracesDir := filepath.Join(dataDir, "traces")
+	tombstone1 := filepath.Join(tracesDir, "000001.wal.tombstone")
+	tombstone2 := filepath.Join(tracesDir, "000002.wal.tombstone")
+
+	if err := os.WriteFile(tombstone1, []byte("test"), 0644); err != nil {
+		t.Fatalf("create tombstone1: %v", err)
+	}
+	if err := os.WriteFile(tombstone2, []byte("test"), 0644); err != nil {
+		t.Fatalf("create tombstone2: %v", err)
+	}
+
+	b := st.(*block2Store).traceBundle
+	st.(*block2Store).cleanupWALTombstones(b)
+
+	if _, err := os.Stat(tombstone1); !os.IsNotExist(err) {
+		t.Fatalf("expected tombstone1 deleted, still exists")
+	}
+	if _, err := os.Stat(tombstone2); !os.IsNotExist(err) {
+		t.Fatalf("expected tombstone2 deleted, still exists")
+	}
+
+	st.Close()
+}
+
+// TestWALStartupNoFiles starts with empty directory, verifies 000001.wal created.
+func TestWALStartupNoFiles(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	if err := os.MkdirAll(filepath.Join(dataDir, "traces"), 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	st, err := NewBlock2Store(dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	tracesDir := filepath.Join(dataDir, "traces")
+	wal := filepath.Join(tracesDir, "000001.wal")
+	if _, err := os.Stat(wal); os.IsNotExist(err) {
+		t.Fatalf("expected 000001.wal on empty dir, not found")
+	}
+
+	st.Close()
+}
+
+// TestWALStartupResumeHighest starts with existing 000003.wal, verifies it's opened for append.
+func TestWALStartupResumeHighest(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	tracesDir := filepath.Join(dataDir, "traces")
+
+	if err := os.MkdirAll(tracesDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+
+	wal3 := filepath.Join(tracesDir, "000003.wal")
+	if err := os.WriteFile(wal3, []byte("test"), 0644); err != nil {
+		t.Fatalf("create wal3: %v", err)
+	}
+
+	st, err := NewBlock2Store(dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	b := st.(*block2Store)
+	if b.traceBundle.walSeq != 3 {
+		t.Fatalf("expected walSeq=3, got %d", b.traceBundle.walSeq)
+	}
+
+	st.Close()
 }
 

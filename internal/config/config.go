@@ -10,7 +10,8 @@ import (
 // Config holds OctoDB runtime configuration.
 type Config struct {
 	Server struct {
-		GRPCAddr string `yaml:"grpc_addr"`
+		GRPCAddr               string `yaml:"grpc_addr"`
+		MemtableFlushThreshold int64  `yaml:"memtable_flush_threshold"`
 	} `yaml:"server"`
 	WAL struct {
 		Path string `yaml:"path"`
@@ -23,6 +24,7 @@ func Load(path string) (*Config, error) {
 
 	// Defaults
 	cfg.Server.GRPCAddr = ":4317"
+	cfg.Server.MemtableFlushThreshold = 64 * 1024 * 1024 // 64 MB
 	cfg.WAL.Path = "octodb.wal"
 
 	data, err := os.ReadFile(path)
@@ -44,6 +46,9 @@ func Load(path string) (*Config, error) {
 func applyEnv(cfg *Config) *Config {
 	if v := os.Getenv("OCTODB_GRPC_ADDR"); v != "" {
 		cfg.Server.GRPCAddr = v
+	}
+	if v := os.Getenv("OCTODB_MEMTABLE_FLUSH_THRESHOLD"); v != "" {
+		fmt.Sscanf(v, "%d", &cfg.Server.MemtableFlushThreshold)
 	}
 	if v := os.Getenv("OCTODB_WAL_PATH"); v != "" {
 		cfg.WAL.Path = v

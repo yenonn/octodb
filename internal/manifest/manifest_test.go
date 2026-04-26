@@ -32,7 +32,7 @@ func TestManagerAppendAndReplay(t *testing.T) {
 		Sequence:      1,
 		SegmentFile:   "sst-00000001.pb",
 		BloomFile:     "sst-00000001.bloom",
-		WALCheckpoint: "traces.wal:1024",
+		WALCheckpoint: "000001.wal:1024",
 		MinKey:        SortKey{TenantID: "t1", Service: "s1"},
 		MaxKey:        SortKey{TenantID: "t1", Service: "s2"},
 		SpanCount:     10,
@@ -83,14 +83,14 @@ func TestNextSequenceMonotonic(t *testing.T) {
 func TestCheckpointRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	m, _ := Open(dir)
-	if err := m.WriteCheckpoint("traces.wal", 2048); err != nil {
+	if err := m.WriteCheckpoint("000001.wal", 2048); err != nil {
 		t.Fatalf("checkpoint: %v", err)
 	}
 	cp, err := m.ReadCheckpoint()
 	if err != nil {
 		t.Fatalf("read checkpoint: %v", err)
 	}
-	if cp.File != "traces.wal" {
+	if cp.File != "000001.wal" {
 		t.Fatalf("checkpoint file mismatch: %q", cp.File)
 	}
 	if cp.Offset != 2048 {
