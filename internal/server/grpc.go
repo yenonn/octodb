@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 
+	collectormetrics "go.opentelemetry.io/proto/otlp/collector/metrics/v1"
 	collectorlogs "go.opentelemetry.io/proto/otlp/collector/logs/v1"
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/grpc"
@@ -39,11 +40,6 @@ func (s *TraceServer) Export(ctx context.Context, req *collectortrace.ExportTrac
 	return &collectortrace.ExportTraceServiceResponse{}, nil
 }
 
-// RegisterTrace registers the TraceServer with the provided grpc.Server.
-func RegisterTrace(s *grpc.Server, ts *TraceServer) {
-	collectortrace.RegisterTraceServiceServer(s, ts)
-}
-
 // LogServer implements the OTLP LogService gRPC endpoint.
 type LogServer struct {
 	collectorlogs.UnimplementedLogsServiceServer
@@ -72,13 +68,37 @@ func (s *LogServer) Export(ctx context.Context, req *collectorlogs.ExportLogsSer
 	return &collectorlogs.ExportLogsServiceResponse{}, nil
 }
 
-// RegisterLog registers the LogServer with the provided grpc.Server.
-func RegisterLog(s *grpc.Server, ls *LogServer) {
-	collectorlogs.RegisterLogsServiceServer(s, ls)
+// MetricServer implements the OTLP MetricsService gRPC endpoint.
+type MetricServer struct {
+	collectormetrics.UnimplementedMetricsServiceServer
+	store store.Store
 }
 
-// RegisterAll registers both TraceServer and LogServer on the grpc.Server.
+// NewMetricServer creates a new MetricServer backed by the given Store.
+func NewMetricServer(s store.Store) *MetricServer {
+	return &MetricServer{store: s}
+}
+
+// Export receives OTLP metric batches, writes them to the Store, and ACKs.
+func (s *MetricServer) Export(ctx context.Context, req *collectormetrics.ExportMetricsServiceRequest) (*collectormetrics.ExportMetricsServiceResponse, error) {
+	p, ok := peer.FromContext(ctx)
+	addr := "unknown"
+	if ok {
+		addr = p.Addr.String()
+	}
+	log.Printf("[Metric] Export from %s — %d ResourceMetrics", addr, len(req.ResourceMetrics))
+
+	const tenantID = "default"
+	if err := s.store.WriteMetrics(ctx, tenantID, req.ResourceMetrics); err != nil {
+		log.Printf("[Metric] WriteMetrics failed: %v", err)
+		return nil, err
+	}
+	return &collectormetrics.ExportMetricsServiceResponse{}, nil
+}
+
+// RegisterAll registers TraceServer, LogServer, and MetricServer on the grpc.Server.
 func RegisterAll(s *grpc.Server, st store.Store) {
-	RegisterTrace(s, NewTraceServer(st))
-	RegisterLog(s, NewLogServer(st))
+	collectortrace.RegisterTraceServiceServer(s, NewTraceServer(st))
+	collectorlogs.RegisterLogsServiceServer(s, NewLogServer(st))
+	collectormetrics.RegisterMetricsServiceServer(s, NewMetricServer(st))
 }

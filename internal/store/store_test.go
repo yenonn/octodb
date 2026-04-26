@@ -10,6 +10,7 @@ import (
 
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	resourcepb "go.opentelemetry.io/proto/otlp/resource/v1"
 )
@@ -365,5 +366,164 @@ func TestLogCorrelatedWithTrace(t *testing.T) {
 	}
 	if len(logs) != 1 {
 		t.Fatalf("expected 1 correlated log, got %d", len(logs))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Metrics unit tests
+// ---------------------------------------------------------------------------
+
+func makeTestMetric(svc, name string, value float64, timeNano uint64) *metricspb.ResourceMetrics {
+	return &metricspb.ResourceMetrics{
+		Resource: &resourcepb.Resource{
+			Attributes: []*commonpb.KeyValue{
+				{Key: "service.name", Value: &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: svc}}},
+			},
+		},
+		ScopeMetrics: []*metricspb.ScopeMetrics{
+			{
+				Scope: &commonpb.InstrumentationScope{Name: "test-scope"},
+				Metrics: []*metricspb.Metric{
+					{
+						Name: name,
+						Data: &metricspb.Metric_Gauge{
+							Gauge: &metricspb.Gauge{
+								DataPoints: []*metricspb.NumberDataPoint{
+									{
+										TimeUnixNano: timeNano,
+										Value:        &metricspb.NumberDataPoint_AsDouble{AsDouble: value},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func TestWriteAndReadMetrics(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	now := uint64(time.Now().UnixNano())
+	m1 := makeTestMetric("svc-a", "cpu.usage", 0.5, now)
+	m2 := makeTestMetric("svc-b", "mem.usage", 0.8, now+1e9)
+
+	ctx := context.Background()
+	if err := st.WriteMetrics(ctx, "default", []*metricspb.ResourceMetrics{m1, m2}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	result, err := st.ReadMetrics(ctx, MetricReadRequest{TenantID: "default"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(result) != 2 {
+		t.Fatalf("expected 2 metrics, got %d", len(result))
+	}
+}
+
+func TestMetricServiceFilter(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	now := uint64(time.Now().UnixNano())
+	m1 := makeTestMetric("svc-a", "cpu.usage", 0.5, now)
+	m2 := makeTestMetric("svc-b", "cpu.usage", 0.6, now)
+
+	ctx := context.Background()
+	_ = st.WriteMetrics(ctx, "default", []*metricspb.ResourceMetrics{m1, m2})
+
+	result, err := st.ReadMetrics(ctx, MetricReadRequest{TenantID: "default", Service: "svc-a"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 svc-a metric, got %d", len(result))
+	}
+}
+
+func TestMetricNameFilter(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	now := uint64(time.Now().UnixNano())
+	m1 := makeTestMetric("svc", "cpu.usage", 0.5, now)
+	m2 := makeTestMetric("svc", "mem.usage", 0.8, now)
+
+	ctx := context.Background()
+	_ = st.WriteMetrics(ctx, "default", []*metricspb.ResourceMetrics{m1, m2})
+
+	result, err := st.ReadMetrics(ctx, MetricReadRequest{TenantID: "default", MetricName: "cpu.usage"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 cpu.usage metric, got %d", len(result))
+	}
+}
+
+func TestMetricTimeFilter(t *testing.T) {
+	st, _ := setupTestStore(t)
+	defer st.Close()
+
+	now := uint64(time.Now().UnixNano())
+	m1 := makeTestMetric("svc", "cpu.usage", 0.5, now-1e12)
+	m2 := makeTestMetric("svc", "cpu.usage", 0.6, now)
+
+	ctx := context.Background()
+	_ = st.WriteMetrics(ctx, "default", []*metricspb.ResourceMetrics{m1, m2})
+
+	result, err := st.ReadMetrics(ctx, MetricReadRequest{
+		TenantID:  "default",
+		Service:   "svc",
+		StartTime: int64(now - 1e11),
+		EndTime:   int64(now + 1e11),
+	})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(result) != 1 {
+		t.Fatalf("expected 1 metric in time range, got %d", len(result))
+	}
+}
+
+func TestMixedAllSignals(t *testing.T) {
+	st, dataDir := setupTestStore(t)
+	defer st.Close()
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	span := makeTestTrace("svc", "span-mixed", now)
+	lg := makeTestLog("svc", "log-mixed", logspb.SeverityNumber_SEVERITY_NUMBER_INFO, nil, nil, now)
+	m := makeTestMetric("svc", "metric-mixed", 0.42, now)
+
+	_ = st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span})
+	_ = st.WriteLogs(ctx, "default", []*logspb.ResourceLogs{lg})
+	_ = st.WriteMetrics(ctx, "default", []*metricspb.ResourceMetrics{m})
+
+	tr, _ := st.ReadTraces(ctx, TraceReadRequest{TenantID: "default"})
+	lr, _ := st.ReadLogs(ctx, LogReadRequest{TenantID: "default"})
+	mr, _ := st.ReadMetrics(ctx, MetricReadRequest{TenantID: "default"})
+
+	if len(tr) != 1 {
+		t.Fatalf("expected 1 trace, got %d", len(tr))
+	}
+	if len(lr) != 1 {
+		t.Fatalf("expected 1 log, got %d", len(lr))
+	}
+	if len(mr) != 1 {
+		t.Fatalf("expected 1 metric, got %d", len(mr))
+	}
+
+	// Verify per-signal WALs exist.
+	for _, sub := range []string{"traces/traces.wal", "logs/logs.wal", "metrics/metrics.wal"} {
+		p := filepath.Join(dataDir, sub)
+		if _, err := os.Stat(p); os.IsNotExist(err) {
+			t.Fatalf("missing %s", p)
+		}
 	}
 }

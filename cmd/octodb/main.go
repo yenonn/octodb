@@ -126,6 +126,31 @@ func main() {
 			})
 		})
 
+		// --- Metrics ---
+		mux.HandleFunc("/v1/metrics", func(w http.ResponseWriter, r *http.Request) {
+			tenantID := r.URL.Query().Get("tenant")
+			if tenantID == "" {
+				tenantID = "default"
+			}
+			req := store.MetricReadRequest{
+				TenantID:  tenantID,
+				Service:   r.URL.Query().Get("service"),
+				MetricName: r.URL.Query().Get("metric"),
+				StartTime: 0,
+				EndTime:   1<<63 - 1,
+			}
+			metrics, err := st.ReadMetrics(r.Context(), req)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{
+				"count":  len(metrics),
+				"tenant": tenantID,
+			})
+		})
+
 		addr := cfg.Server.GRPCAddr
 		if addr[0] == ':' {
 			addr = "localhost" + addr

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
@@ -58,6 +59,20 @@ func (s *WALStore) WriteLogs(ctx context.Context, tenantID string, logs []*logsp
 	return s.w.Sync()
 }
 
+// WriteMetrics writes each ResourceMetrics as a separate WAL record, then fsyncs.
+func (s *WALStore) WriteMetrics(ctx context.Context, tenantID string, metrics []*metricspb.ResourceMetrics) error {
+	for _, rm := range metrics {
+		data, err := proto.Marshal(rm)
+		if err != nil {
+			return err
+		}
+		if err := s.w.Append(data); err != nil {
+			return err
+		}
+	}
+	return s.w.Sync()
+}
+
 // ReadTraces is not supported in Block 1.
 func (s *WALStore) ReadTraces(ctx context.Context, req TraceReadRequest) ([]*tracepb.ResourceSpans, error) {
 	return nil, fmt.Errorf("walstore: ReadTraces not implemented in Block 1")
@@ -71,6 +86,11 @@ func (s *WALStore) ReadTraceByID(ctx context.Context, tenantID, traceID string) 
 // ReadLogs is not supported in Block 1.
 func (s *WALStore) ReadLogs(ctx context.Context, req LogReadRequest) ([]*logspb.ResourceLogs, error) {
 	return nil, fmt.Errorf("walstore: ReadLogs not implemented in Block 1")
+}
+
+// ReadMetrics is not supported in Block 1.
+func (s *WALStore) ReadMetrics(ctx context.Context, req MetricReadRequest) ([]*metricspb.ResourceMetrics, error) {
+	return nil, fmt.Errorf("walstore: ReadMetrics not implemented in Block 1")
 }
 
 // Close cleanly shuts down the WAL.

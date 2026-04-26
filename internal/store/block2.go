@@ -1,7 +1,7 @@
 // Package store provides Block 2 storage: WAL + sorted memtable + segment flush.
 // Block 3 additions: block index footer, bloom filter, time-range seek.
 // Block 4 additions: two-level trace_id index (global locator + per-segment sidecar).
-// Block 4b additions: log signal path, dual WAL dual memtable.
+// Block 4b additions: log + metric signal paths, triple WAL triple memtable.
 package store
 
 import (
@@ -13,6 +13,7 @@ import (
 	"time"
 
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 	"google.golang.org/protobuf/proto"
 
@@ -44,8 +45,9 @@ type signalBundle struct {
 type block2Store struct {
 	dataDir string
 
-	traceBundle *signalBundle
-	logBundle   *signalBundle
+	traceBundle  *signalBundle
+	logBundle    *signalBundle
+	metricBundle *signalBundle
 
 	stopFlush chan struct{}
 	flushDone sync.WaitGroup
@@ -78,6 +80,13 @@ func NewBlock2Store(dataDir string) (Store, error) {
 	}
 	s.logBundle = lb
 
+	// --- Metric bundle ---
+	mb, err := s.createBundle("metrics", "metrics.wal")
+	if err != nil {
+		return nil, fmt.Errorf("block2: metric bundle: %w", err)
+	}
+	s.metricBundle = mb
+
 	// Rebuild locators from existing segments.
 	if err := s.rebuildLocator(s.traceBundle); err != nil {
 		return nil, fmt.Errorf("block2: rebuild trace locator: %w", err)
@@ -85,8 +94,11 @@ func NewBlock2Store(dataDir string) (Store, error) {
 	if err := s.rebuildLocator(s.logBundle); err != nil {
 		return nil, fmt.Errorf("block2: rebuild log locator: %w", err)
 	}
+	if err := s.rebuildLocator(s.metricBundle); err != nil {
+		return nil, fmt.Errorf("block2: rebuild metric locator: %w", err)
+	}
 
-	// Replay WAL for both bundles.
+	// Replay WAL for three bundles.
 	if err := s.replayBundle(s.traceBundle, func(raw []byte) {
 		key, data := s.extractTraceSortKey(raw)
 		s.traceBundle.set.Insert(key, data)
@@ -101,6 +113,13 @@ func NewBlock2Store(dataDir string) (Store, error) {
 		_ = s.Close()
 		return nil, fmt.Errorf("block2: replay logs: %w", err)
 	}
+	if err := s.replayBundle(s.metricBundle, func(raw []byte) {
+		key, data := s.extractMetricSortKey(raw)
+		s.metricBundle.set.Insert(key, data)
+	}); err != nil {
+		_ = s.Close()
+		return nil, fmt.Errorf("block2: replay metrics: %w", err)
+	}
 
 	// If anything is in memtable, flush now (covers immediate-restoration cases).
 	if s.traceBundle.set.ActiveSize() > 0 {
@@ -108,6 +127,9 @@ func NewBlock2Store(dataDir string) (Store, error) {
 	}
 	if s.logBundle.set.ActiveSize() > 0 {
 		_ = s.flushBundle(s.logBundle)
+	}
+	if s.metricBundle.set.ActiveSize() > 0 {
+		_ = s.flushBundle(s.metricBundle)
 	}
 
 	s.flushDone.Add(1)
@@ -255,6 +277,56 @@ func (s *block2Store) extractLogTraceID(raw []byte) string {
 		return fmt.Sprintf("%x", rl.ScopeLogs[0].LogRecords[0].TraceId)
 	}
 	return ""
+}
+
+// ---------------------------------------------------------------------------
+// Metric sort key / extraction helpers
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) extractMetricSortKey(raw []byte) (memtable.Key, []byte) {
+	var rm metricspb.ResourceMetrics
+	if err := proto.Unmarshal(raw, &rm); err != nil {
+		return memtable.Key{}, nil
+	}
+	svc := ""
+	if rm.Resource != nil {
+		for _, attr := range rm.Resource.Attributes {
+			if attr.Key == "service.name" {
+				svc = attr.Value.GetStringValue()
+				break
+			}
+		}
+	}
+	var timeNano uint64
+	var metricName string
+	if len(rm.ScopeMetrics) > 0 && len(rm.ScopeMetrics[0].Metrics) > 0 {
+		m := rm.ScopeMetrics[0].Metrics[0]
+		metricName = m.Name
+		// Use start_time_unix_nano from first gauge / sum / histogram data point.
+		switch d := m.Data.(type) {
+		case *metricspb.Metric_Gauge:
+			if len(d.Gauge.DataPoints) > 0 {
+				timeNano = d.Gauge.DataPoints[0].TimeUnixNano
+			}
+		case *metricspb.Metric_Sum:
+			if len(d.Sum.DataPoints) > 0 {
+				timeNano = d.Sum.DataPoints[0].TimeUnixNano
+			}
+		case *metricspb.Metric_Histogram:
+			if len(d.Histogram.DataPoints) > 0 {
+				timeNano = d.Histogram.DataPoints[0].TimeUnixNano
+			}
+		case *metricspb.Metric_Summary:
+			if len(d.Summary.DataPoints) > 0 {
+				timeNano = d.Summary.DataPoints[0].TimeUnixNano
+			}
+		}
+	}
+	if metricName == "" {
+		metricName = "none"
+	}
+	key := otelutil.MetricSortKey{TenantID: "default", Service: svc, MetricName: metricName, TimeNano: timeNano}
+	return memtable.Key{DType: otelutil.TypeMetric, Key: key.Key()}, raw
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +693,9 @@ func (s *block2Store) Close() error {
 	if s.logBundle != nil {
 		_ = s.logBundle.wal.Close()
 	}
+	if s.metricBundle != nil {
+		_ = s.metricBundle.wal.Close()
+	}
 	return nil
 }
 
@@ -642,6 +717,9 @@ func (s *block2Store) flushMonitor() {
 			if s.logBundle.set.ActiveSize() > 0 {
 				_ = s.flushBundle(s.logBundle)
 			}
+			if s.metricBundle.set.ActiveSize() > 0 {
+				_ = s.flushBundle(s.metricBundle)
+			}
 			return
 		case <-ticker.C:
 			if s.traceBundle.set.ActiveSize() >= MemtableFlushThreshold {
@@ -649,6 +727,9 @@ func (s *block2Store) flushMonitor() {
 			}
 			if s.logBundle.set.ActiveSize() >= MemtableFlushThreshold {
 				_ = s.flushBundle(s.logBundle)
+			}
+			if s.metricBundle.set.ActiveSize() >= MemtableFlushThreshold {
+				_ = s.flushBundle(s.metricBundle)
 			}
 		}
 	}
@@ -758,4 +839,163 @@ func (s *block2Store) flushBundle(b *signalBundle) error {
 	b.wal = w
 
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// WriteMetrics
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) WriteMetrics(ctx context.Context, tenantID string, metrics []*metricspb.ResourceMetrics) error {
+	for _, rm := range metrics {
+		data, err := proto.Marshal(rm)
+		if err != nil {
+			return err
+		}
+		if err := s.metricBundle.wal.Append(data); err != nil {
+			return err
+		}
+	}
+	if err := s.metricBundle.wal.Sync(); err != nil {
+		return err
+	}
+	for _, rm := range metrics {
+		data, _ := proto.Marshal(rm)
+		key, data2 := s.extractMetricSortKey(data)
+		s.metricBundle.set.Insert(key, data2)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// ReadMetrics
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) ReadMetrics(ctx context.Context, req MetricReadRequest) ([]*metricspb.ResourceMetrics, error) {
+	var result []*metricspb.ResourceMetrics
+
+	active, flushing := s.metricBundle.set.Snapshot()
+	for _, tbl := range []*memtable.Memtable{active, flushing} {
+		if tbl == nil {
+			continue
+		}
+		tbl.AscendByType(otelutil.TypeMetric, func(key memtable.Key, value []byte) bool {
+			var rm metricspb.ResourceMetrics
+			if err := proto.Unmarshal(value, &rm); err != nil {
+				return true
+			}
+			if !s.metricKeyMatches(rm, req) {
+				return true
+			}
+			result = append(result, &rm)
+			return true
+		})
+	}
+
+	for _, rec := range s.metricBundle.man.AllRecords() {
+		if rec.MinKey.TenantID != req.TenantID && rec.MaxKey.TenantID != req.TenantID {
+			continue
+		}
+		if req.Service != "" && rec.MinKey.Service != req.Service && rec.MaxKey.Service != req.Service {
+			continue
+		}
+		if uint64(req.EndTime) <= rec.MinKey.TimeNano || uint64(req.StartTime) >= rec.MaxKey.TimeNano {
+			continue
+		}
+		if req.Service != "" && rec.BloomFile != "" {
+			bloomPath := filepath.Join(s.dataDir, s.metricBundle.subdir, rec.BloomFile)
+			if bf, err := bloom.Load(bloomPath); err == nil {
+				target := otelutil.MetricSortKey{TenantID: req.TenantID, Service: req.Service, MetricName: req.MetricName, TimeNano: 0}
+				if !bf.MightContain(target.Key()) {
+					continue
+				}
+			}
+		}
+
+		segPath := filepath.Join(s.dataDir, s.metricBundle.subdir, rec.SegmentFile)
+		seg, err := segment.Open(segPath)
+		if err != nil {
+			continue
+		}
+
+		if req.StartTime > 0 && len(seg.Footer().Blocks) > 0 {
+			target := otelutil.MetricSortKey{TenantID: req.TenantID, Service: req.Service, MetricName: req.MetricName, TimeNano: uint64(req.StartTime)}
+			_ = seg.SeekTo(target.Key())
+		}
+
+		for {
+			data, err := seg.Next()
+			if err != nil {
+				break
+			}
+			var rm metricspb.ResourceMetrics
+			if err := proto.Unmarshal(data, &rm); err != nil {
+				continue
+			}
+			if !s.metricKeyMatches(rm, req) {
+				continue
+			}
+			result = append(result, &rm)
+		}
+		_ = seg.Close()
+	}
+
+	return result, nil
+}
+
+func (s *block2Store) metricKeyMatches(rm metricspb.ResourceMetrics, req MetricReadRequest) bool {
+	svc := ""
+	if rm.Resource != nil {
+		for _, a := range rm.Resource.Attributes {
+			if a.Key == "service.name" {
+				svc = a.Value.GetStringValue()
+				break
+			}
+		}
+	}
+	if req.Service != "" && svc != req.Service {
+		return false
+	}
+	// Metric name + time check.
+	var timeNano uint64
+	var metricName string
+	var mType string
+	if len(rm.ScopeMetrics) > 0 && len(rm.ScopeMetrics[0].Metrics) > 0 {
+		m := rm.ScopeMetrics[0].Metrics[0]
+		metricName = m.Name
+		switch d := m.Data.(type) {
+		case *metricspb.Metric_Gauge:
+			mType = "gauge"
+			if len(d.Gauge.DataPoints) > 0 {
+				timeNano = d.Gauge.DataPoints[0].TimeUnixNano
+			}
+		case *metricspb.Metric_Sum:
+			mType = "sum"
+			if len(d.Sum.DataPoints) > 0 {
+				timeNano = d.Sum.DataPoints[0].TimeUnixNano
+			}
+		case *metricspb.Metric_Histogram:
+			mType = "histogram"
+			if len(d.Histogram.DataPoints) > 0 {
+				timeNano = d.Histogram.DataPoints[0].TimeUnixNano
+			}
+		case *metricspb.Metric_Summary:
+			mType = "summary"
+			if len(d.Summary.DataPoints) > 0 {
+				timeNano = d.Summary.DataPoints[0].TimeUnixNano
+			}
+		}
+	}
+	if req.MetricName != "" && metricName != req.MetricName {
+		return false
+	}
+	if req.MetricType != "" && mType != req.MetricType {
+		return false
+	}
+	if req.StartTime > 0 && int64(timeNano) < req.StartTime {
+		return false
+	}
+	if req.EndTime > 0 && int64(timeNano) >= req.EndTime {
+		return false
+	}
+	return true
 }

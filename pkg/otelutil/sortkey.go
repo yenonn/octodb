@@ -7,8 +7,9 @@ import "fmt"
 type DataType string
 
 const (
-	TypeTrace DataType = "trace"
-	TypeLog   DataType = "log"
+	TypeTrace  DataType = "trace"
+	TypeLog    DataType = "log"
+	TypeMetric DataType = "metric"
 )
 
 // ---------------------------------------------------------------------------
@@ -75,3 +76,24 @@ func LogFromGeneric(key string) LogSortKey {
 		&k.TenantID, &k.Service, &k.TimeNano, &k.TraceID, &k.LogID)
 	return k
 }
+
+// ---------------------------------------------------------------------------
+// Metrics: SortKey for ResourceMetrics.
+// (tenant, service.name, metric_name, time).
+// ---------------------------------------------------------------------------
+
+// MetricSortKey defines physical layout for metrics.
+// Metrics are primarily queried by metric name + time range.
+type MetricSortKey struct {
+	TenantID  string
+	Service   string
+	MetricName string
+	TimeNano  uint64 // start_time_unix_nano of first data point
+	// Optional: metric type suffix for grouping like metrics
+}
+
+func (k MetricSortKey) Key() string {
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%016x",
+		k.TenantID, k.Service, k.MetricName, k.TimeNano)
+}
+
