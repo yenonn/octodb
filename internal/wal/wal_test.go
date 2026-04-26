@@ -476,3 +476,68 @@ func TestOpenStatError(t *testing.T) {
 	}
 }
 
+func BenchmarkWALAppendSingle(b *testing.B) {
+	path := "bench_single.wal"
+	defer os.Remove(path)
+
+	sizes := []int{100, 1000, 10000}
+	for _, size := range sizes {
+		b.Run(fmt.Sprintf("size=%d", size), func(b *testing.B) {
+			w, _ := Open(path)
+			defer w.Close()
+
+			data := make([]byte, size)
+			for i := range data {
+				data[i] = byte(i)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := w.Append(data); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkWALAppendBatch(b *testing.B) {
+	path := "bench_batch.wal"
+	defer os.Remove(path)
+
+	benchmarks := []struct {
+		name  string
+		count int
+		size  int
+	}{
+		{"batch=10_size=100", 10, 100},
+		{"batch=100_size=100", 100, 100},
+		{"batch=10_size=1000", 10, 1000},
+		{"batch=100_size=1000", 100, 1000},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			w, _ := Open(path)
+			defer w.Close()
+
+			data := make([]byte, bm.size)
+			for i := range data {
+				data[i] = byte(i)
+			}
+
+			batch := make([][]byte, bm.count)
+			for i := range batch {
+				batch[i] = data
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := w.AppendBatch(batch); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+

@@ -1509,3 +1509,73 @@ func TestConcurrentFlushAndTombstoneCleanup(t *testing.T) {
 	st.Close()
 }
 
+func BenchmarkWriteTraces(b *testing.B) {
+	dir := b.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	st, _ := NewBlock2Store(dataDir)
+	defer st.Close()
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	sizes := []int{1, 10, 100}
+
+	for _, count := range sizes {
+		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			spans := make([]*tracepb.ResourceSpans, count)
+			for i := range spans {
+				spans[i] = makeTestTrace("bench-svc", fmt.Sprintf("span-%d", i), now)
+			}
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := st.WriteTraces(ctx, "default", spans); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkConcurrentWrites(b *testing.B) {
+	dir := b.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	st, _ := NewBlock2Store(dataDir)
+	defer st.Close()
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	concurrency := []int{1, 4, 8, 16}
+
+	for _, goroutines := range concurrency {
+		b.Run(fmt.Sprintf("goroutines=%d", goroutines), func(b *testing.B) {
+			spans := make([]*tracepb.ResourceSpans, 10)
+			for i := range spans {
+				spans[i] = makeTestTrace("bench-svc", fmt.Sprintf("span-%d", i), now)
+			}
+
+			b.ResetTimer()
+			b.StopTimer()
+
+			var wg sync.WaitGroup
+			for i := 0; i < goroutines; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := 0; i < b.N/goroutines; i++ {
+						if err := st.WriteTraces(ctx, "default", spans); err != nil {
+							b.Fatal(err)
+						}
+					}
+				}()
+			}
+
+			b.StartTimer()
+			wg.Wait()
+		})
+	}
+}
+
