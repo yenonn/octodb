@@ -155,19 +155,6 @@ tenant: team-sre
 
 ---
 
-## The Octo Platform
-
-OctoDB is part of a broader platform:
-
-| Project | Layer | Description |
-|---------|-------|-------------|
-| **Octoroute** | Network plane | mTLS cert-based routing, Kubernetes operator, nginx/njs gateway |
-| **OctoDB** | Data plane | OTel-native multi-tenant database, OTLP ingestion, ACL, unified signal storage |
-
-Together: zero-trust, OTel-native, Kubernetes-native infrastructure primitives.
-
----
-
 ## Implementation Plan
 
 | Phase | Status | Description |
@@ -263,7 +250,7 @@ octodb/
 
 ## Author
 
-Yen-Onn — Senior Platform Engineer, SAP Singapore  
+Yen-Onn — Senior Platform Engineer
 Expertise: Go, Kubernetes, OpenTelemetry, Kafka, mTLS, distributed systems  
 Related work: Octoroute (mTLS cert-based Kubernetes routing operator)
 
