@@ -1,0 +1,14 @@
+*.wal
+octodb-data/
+vendor/
+.env
+bin/
+*.test
+.DS_Store
+octodb
+replay_check
+testclient
+sst-*.pb
+manifest.log
+manifest.log.checkpoint
+amp

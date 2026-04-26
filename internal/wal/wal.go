@@ -1,0 +1,137 @@
+package wal
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"os"
+	"sync"
+)
+
+// Writer manages an append-only WAL file.
+// Safe for concurrent use — a mutex serialises appenders.
+type Writer struct {
+	mu     sync.Mutex
+	file   *os.File
+	path   string
+	offset int64 // current write offset in bytes
+}
+
+// Open opens (or creates) a WAL file for appending.
+func Open(path string) (*Writer, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("open wal %q: %w", path, err)
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("stat wal %q: %w", path, err)
+	}
+
+	return &Writer{
+		file:   f,
+		path:   path,
+		offset: info.Size(),
+	}, nil
+}
+
+// Append writes a length-prefixed record to the WAL.
+// Format: [4 bytes big-endian length][N bytes payload].
+func (w *Writer) Append(data []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	n := len(data)
+	if n == 0 {
+		return fmt.Errorf("wal: cannot append empty record")
+	}
+	if n > 0x7FFFFFFF {
+		return fmt.Errorf("wal: record too large (%d bytes)", n)
+	}
+
+	buf := make([]byte, 4+n)
+	binary.BigEndian.PutUint32(buf[:4], uint32(n))
+	copy(buf[4:], data)
+
+	written, err := w.file.Write(buf)
+	if err != nil {
+		return fmt.Errorf("wal: write error: %w", err)
+	}
+	w.offset += int64(written)
+	return nil
+}
+
+// Sync flushes the WAL to disk (fsync).
+// Must be called after a batch of Appends before ACKing the caller.
+func (w *Writer) Sync() error {
+	return w.file.Sync()
+}
+
+// Close closes the underlying file.
+func (w *Writer) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.file.Close()
+}
+
+// Offset returns the current file size / next write offset.
+func (w *Writer) Offset() int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.offset
+}
+
+// ---------------------------------------------------------------------------
+// Reader
+// ---------------------------------------------------------------------------
+
+// Reader reads length-prefixed records from a WAL.
+type Reader struct {
+	r io.Reader
+	f io.Closer // optional underlying file
+}
+
+// NewReader creates a reader from an io.Reader.
+func NewReader(r io.Reader) *Reader {
+	return &Reader{r: r}
+}
+
+// NewReaderFromFile opens path and returns a reader.
+func NewReaderFromFile(path string) (*Reader, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open wal for replay %q: %w", path, err)
+	}
+	return &Reader{r: f, f: f}, nil
+}
+
+// Next reads the next record.
+// Returns io.EOF when there are no more complete records.
+func (r *Reader) Next() ([]byte, error) {
+	var length uint32
+	if err := binary.Read(r.r, binary.BigEndian, &length); err != nil {
+		if err == io.EOF {
+			return nil, io.EOF
+		}
+		return nil, fmt.Errorf("wal: read length: %w", err)
+	}
+
+	data := make([]byte, length)
+	if _, err := io.ReadFull(r.r, data); err != nil {
+		if err == io.EOF {
+			return nil, fmt.Errorf("wal: record truncated (expected %d bytes, got EOF)", length)
+		}
+		return nil, fmt.Errorf("wal: read data: %w", err)
+	}
+	return data, nil
+}
+
+// Close closes the underlying file if it was opened by NewReaderFromFile.
+func (r *Reader) Close() error {
+	if r.f != nil {
+		return r.f.Close()
+	}
+	return nil
+}
