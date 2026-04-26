@@ -44,12 +44,14 @@ const MemtableMaxIdleFlush = 30 * time.Second
 // StoreConfig holds tunable parameters for the block2 store.
 type StoreConfig struct {
 	MemtableFlushThreshold int64
+	WALSyncInterval       time.Duration // WAL sync interval (default 10ms) - shorter = more durable, slower = faster
 }
 
 // DefaultStoreConfig returns production defaults.
 func DefaultStoreConfig() StoreConfig {
 	return StoreConfig{
 		MemtableFlushThreshold: DefaultMemtableFlushThreshold,
+		WALSyncInterval:       10 * time.Millisecond,
 	}
 }
 
@@ -115,6 +117,9 @@ func NewBlock2StoreWithConfig(dataDir string, cfg StoreConfig) (Store, error) {
 	if cfg.MemtableFlushThreshold <= 0 {
 		cfg.MemtableFlushThreshold = DefaultMemtableFlushThreshold
 	}
+	if cfg.WALSyncInterval <= 0 {
+		cfg.WALSyncInterval = 10 * time.Millisecond // default 10ms
+	}
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, fmt.Errorf("block2: mkdir: %w", err)
 	}
@@ -126,21 +131,21 @@ func NewBlock2StoreWithConfig(dataDir string, cfg StoreConfig) (Store, error) {
 	}
 
 	// --- Trace bundle ---
-	tb, err := s.createBundle("traces")
+	tb, err := s.createBundle("traces", s.cfg.WALSyncInterval)
 	if err != nil {
 		return nil, fmt.Errorf("block2: trace bundle: %w", err)
 	}
 	s.traceBundle = tb
 
 	// --- Log bundle ---
-	lb, err := s.createBundle("logs")
+	lb, err := s.createBundle("logs", s.cfg.WALSyncInterval)
 	if err != nil {
 		return nil, fmt.Errorf("block2: log bundle: %w", err)
 	}
 	s.logBundle = lb
 
 	// --- Metric bundle ---
-	mb, err := s.createBundle("metrics")
+	mb, err := s.createBundle("metrics", s.cfg.WALSyncInterval)
 	if err != nil {
 		return nil, fmt.Errorf("block2: metric bundle: %w", err)
 	}
@@ -201,7 +206,7 @@ func NewBlock2StoreWithConfig(dataDir string, cfg StoreConfig) (Store, error) {
 	return s, nil
 }
 
-func (s *block2Store) createBundle(subdir string) (*signalBundle, error) {
+func (s *block2Store) createBundle(subdir string, syncInterval time.Duration) (*signalBundle, error) {
 	dir := filepath.Join(s.dataDir, subdir)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, err
@@ -214,7 +219,7 @@ func (s *block2Store) createBundle(subdir string) (*signalBundle, error) {
 	}
 
 	walPath := filepath.Join(dir, fmt.Sprintf("%06d.wal", walSeq))
-	w, err := wal.OpenAsync(walPath, 100*time.Millisecond)
+	w, err := wal.OpenAsync(walPath, syncInterval)
 	if err != nil {
 		return nil, fmt.Errorf("wal open %s: %w", walPath, err)
 	}
@@ -1345,7 +1350,7 @@ func (s *block2Store) flushBundle(b *signalBundle) error {
 	_ = oldWAL.Close()
 	_ = os.Rename(oldPath, oldPath+".tombstone")
 	b.walSeq++
-	w, err := wal.OpenAsync(b.walPath(), 100*time.Millisecond)
+	w, err := wal.OpenAsync(b.walPath(), s.cfg.WALSyncInterval)
 	if err != nil {
 		return fmt.Errorf("flush: reopen wal: %w", err)
 	}
