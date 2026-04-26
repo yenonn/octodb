@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -1249,5 +1250,148 @@ func TestWALStartupResumeHighest(t *testing.T) {
 	}
 
 	st.Close()
+}
+
+// TestConcurrentWriteAndFlush verifies writes don't race with flush.
+func TestConcurrentWriteAndFlush(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	st, err := NewBlock2StoreWithConfig(dataDir, StoreConfig{
+		MemtableFlushThreshold: 2048,
+	})
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				span := makeTestTrace(fmt.Sprintf("svc-%d", idx), fmt.Sprintf("span-%d-%d", idx, j), uint64(time.Now().UnixNano()))
+				if err := st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span}); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(i)
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		time.Sleep(100 * time.Millisecond)
+		b := st.(*block2Store)
+		b.flushBundle(b.traceBundle)
+	}()
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		if err != nil {
+			t.Fatalf("write error: %v", err)
+		}
+	}
+
+	result, err := st.ReadTraces(ctx, TraceReadRequest{TenantID: "default"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(result) == 0 {
+		t.Fatalf("expected traces after concurrent write+flush, got 0")
+	}
+
+	st.Close()
+}
+
+// TestConcurrentWriteAndCompaction verifies writes don't race with compaction.
+func TestConcurrentWriteAndCompaction(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+
+	st, err := NewBlock2Store(dataDir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+
+	for i := 0; i < 20; i++ {
+		span := makeTestTrace("compact-svc", fmt.Sprintf("span-%d", i), now+uint64(i))
+		if err := st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+
+	st.Close()
+
+	st2, err := NewBlock2StoreWithConfig(dataDir, StoreConfig{
+		MemtableFlushThreshold: 1,
+	})
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+
+	b := st2.(*block2Store)
+	for i := 0; i < 10; i++ {
+		span := makeTestTrace("compact-svc-2", fmt.Sprintf("span-%d", i), now+uint64(i+100))
+		if err := st2.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		time.Sleep(50 * time.Millisecond)
+		if err := b.compactBundle(b.traceBundle); err != nil {
+			errCh <- err
+		}
+	}()
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < 5; j++ {
+				span := makeTestTrace(fmt.Sprintf("write-svc-%d", idx), fmt.Sprintf("span-%d-%d", idx, j), uint64(time.Now().UnixNano()))
+				if err := st2.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span}); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("concurrent error: %v", err)
+		}
+	default:
+	}
+
+	result, err := st2.ReadTraces(ctx, TraceReadRequest{TenantID: "default"})
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(result) < 10 {
+		t.Fatalf("expected traces after concurrent write+compact, got %d", len(result))
+	}
+
+	st2.Close()
 }
 

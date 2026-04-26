@@ -78,6 +78,16 @@ func (b *signalBundle) walFileName() string {
 	return fmt.Sprintf("%06d.wal", b.walSeq)
 }
 
+// syncDir syncs the directory to ensure rename is durable.
+func syncDir(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
+}
+
 type block2Store struct {
 	dataDir string
 	cfg     StoreConfig
@@ -531,6 +541,8 @@ func (s *block2Store) WriteTraces(ctx context.Context, tenantID string, spans []
 		}
 		batch = append(batch, data)
 	}
+	s.traceBundle.mu.Lock()
+	defer s.traceBundle.mu.Unlock()
 	if err := s.traceBundle.wal.AppendBatch(batch); err != nil {
 		return err
 	}
@@ -732,6 +744,8 @@ func (s *block2Store) WriteLogs(ctx context.Context, tenantID string, logs []*lo
 		}
 		batch = append(batch, data)
 	}
+	s.logBundle.mu.Lock()
+	defer s.logBundle.mu.Unlock()
 	if err := s.logBundle.wal.AppendBatch(batch); err != nil {
 		return err
 	}
@@ -1054,6 +1068,9 @@ func (s *block2Store) sweepBundleTTL(b *signalBundle) {
 	if b == nil {
 		return
 	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	retention := b.retention
 	if retention <= 0 {
 		retention = DefaultRetention
@@ -1096,6 +1113,9 @@ func (s *block2Store) cleanupWALTombstones(b *signalBundle) {
 
 // compactBundle merges adjacent segments and rewrites manifest.
 func (s *block2Store) compactBundle(b *signalBundle) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	records := b.man.AllRecords()
 	if len(records) < 2 {
 		return nil
@@ -1209,6 +1229,9 @@ func (s *block2Store) compactBundle(b *signalBundle) error {
 // ---------------------------------------------------------------------------
 
 func (s *block2Store) flushBundle(b *signalBundle) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
 	flushing := b.set.Rotate()
 	if flushing == nil {
 		return nil
@@ -1302,9 +1325,16 @@ func (s *block2Store) flushBundle(b *signalBundle) error {
 		return fmt.Errorf("flush: checkpoint: %w", err)
 	}
 
+	// Sync directory to ensure rename is durable.
+	if err := syncDir(b.walDir); err != nil {
+		return fmt.Errorf("flush: sync dir: %w", err)
+	}
+
 	// Rotate WAL: close current, mark as tombstone, open next.
-	_ = b.wal.Close()
-	_ = os.Rename(b.walPath(), b.walPath()+".tombstone")
+	oldWAL := b.wal
+	oldPath := b.walPath()
+	_ = oldWAL.Close()
+	_ = os.Rename(oldPath, oldPath+".tombstone")
 	b.walSeq++
 	w, err := wal.Open(b.walPath())
 	if err != nil {
@@ -1326,6 +1356,8 @@ func (s *block2Store) WriteMetrics(ctx context.Context, tenantID string, metrics
 		}
 		batch = append(batch, data)
 	}
+	s.metricBundle.mu.Lock()
+	defer s.metricBundle.mu.Unlock()
 	if err := s.metricBundle.wal.AppendBatch(batch); err != nil {
 		return err
 	}
