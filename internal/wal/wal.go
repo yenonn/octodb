@@ -59,16 +59,22 @@ func (w *Writer) AppendBatch(batch [][]byte) error {
 		total += 8 + n
 	}
 
-	buf := make([]byte, 0, total)
+	buf := make([]byte, total)
+	pos := 0
 	for _, data := range batch {
 		n := len(data)
-		recordLen := make([]byte, 4)
-		binary.BigEndian.PutUint32(recordLen, uint32(n))
-		buf = append(buf, recordLen...)
-		checksum := make([]byte, 4)
-		binary.BigEndian.PutUint32(checksum, crc32.ChecksumIEEE(data))
-		buf = append(buf, checksum...)
-		buf = append(buf, data...)
+		// Use direct byte manipulation to avoid BigEndian allocation overhead
+		buf[pos] = byte(n >> 24)
+		buf[pos+1] = byte(n >> 16)
+		buf[pos+2] = byte(n >> 8)
+		buf[pos+3] = byte(n)
+		checksum := crc32.ChecksumIEEE(data)
+		buf[pos+4] = byte(checksum >> 24)
+		buf[pos+5] = byte(checksum >> 16)
+		buf[pos+6] = byte(checksum >> 8)
+		buf[pos+7] = byte(checksum)
+		copy(buf[pos+8:], data)
+		pos += 8 + n
 	}
 
 	written, err := w.file.Write(buf)
@@ -95,8 +101,15 @@ func (w *Writer) Append(data []byte) error {
 
 	checksum := crc32.ChecksumIEEE(data)
 	buf := make([]byte, 8+n)
-	binary.BigEndian.PutUint32(buf[:4], uint32(n))
-	binary.BigEndian.PutUint32(buf[4:8], checksum)
+	// Use direct byte manipulation to avoid BigEndian allocation overhead
+	buf[0] = byte(n >> 24)
+	buf[1] = byte(n >> 16)
+	buf[2] = byte(n >> 8)
+	buf[3] = byte(n)
+	buf[4] = byte(checksum >> 24)
+	buf[5] = byte(checksum >> 16)
+	buf[6] = byte(checksum >> 8)
+	buf[7] = byte(checksum)
 	copy(buf[8:], data)
 
 	written, err := w.file.Write(buf)
