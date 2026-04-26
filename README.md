@@ -170,24 +170,94 @@ Together: zero-trust, OTel-native, Kubernetes-native infrastructure primitives.
 
 ## Implementation Plan
 
-### Phase 1 — Go Prototype
-Prove the data model and ACL design. OTLP receiver, Postgres-backed storage (JSONB for attributes, CTEs for span trees, row-level security for tenancy), basic HTTP query API. Validate tenant routing from resource attributes.
+| Phase | Status | Description |
+|-------|--------|-----------|
+| **Phase 1 — Go Prototype** | ✅ **Complete** | Core storage engine (WAL, segmented block store, memtable, bloom filters, index, manifest) implemented in Go. Integration tests validate WAL crash recovery and memtable flush pipelines. Postgres backend dropped in favor of native append-only storage. |
+| **Phase 2 — Storage Design** | 🔄 **In Progress** | Native append-only format with two-level index proven. Query layer (gRPC / HTTP) scaffolded with Trace, Log, and Metric read paths. OTLP receiver and Block 2 query tests under active development. |
+| **Phase 3 — Rust Core** | ⏳ **Pending** | Production storage engine rewrite for memory safety and performance. Go codebase serves as correctness reference. |
+| **Phase 4 — Open Source + Consulting** | ⏳ **Pending** | Public release and migration-consulting practice. |
 
-### Phase 2 — Storage Design
-Based on real query patterns from Phase 1, design the actual data structures. Evaluate Bε-tree vs ART for primary indexes. Design the WAL format.
+### Completed Components
+- ✅ **WAL** (`internal/wal`) — append-only log with fsync boundary
+- ✅ **Segment Store** (`internal/segment`) — structured block persistence
+- ✅ **Memtable** (`internal/memtable`) — in-memory write buffer with flush pipeline
+- ✅ **Bloom Filters** (`internal/bloom`) — fast segment membership tests
+- ✅ **Index** (`internal/index`) — trace ID → segment locator
+- ✅ **Manifest** (`internal/manifest`) — SST metadata manager
+- ✅ **Storage Orchestrator** (`internal/store`) — unified WAL + memtable + segment lifecycle
+- ✅ **Config Loader** (`internal/config`) — YAML-based topology configuration
+- ✅ **Replay Checker** (`cmd/replay_check`) — WAL verification tool
+- ✅ **Integration Tests** (`tests/integration`) — Block 1 (WAL crash recovery) & Block 2 (memtable flush + query)
 
-### Phase 3 — Rust Core
-Rewrite the storage engine in Rust. Go prototype becomes the correctness reference. Rust gives production-grade performance, memory safety, and the credibility the project needs for enterprise adoption.
+### In Progress
+- 🚧 **OTLP Query Layer** (`internal/server`) — gRPC + HTTP handlers for Trace, Log, and Metric reads
+- 🚧 **ACL Enforcement** — ABAC rules engine tied to resource attributes
 
-### Phase 4 — Open Source + Consulting
-Open source the core. Build consulting practice around OctoDB deployments, migrations from existing stacks, and custom signal pipeline design.
+### Pending
+- ⏳ OTLP Ingestion Receiver (native gRPC collector)
+- ⏳ Block 2 query predicate push-down
+- ⏳ Rust core rewrite
+- ⏳ Production packaging & Helm charts
 
 ---
 
 ## Status
 
-> 🌱 **Ideation / Pre-prototype**
-> Architecture designed. Implementation not started.
+> ⚙️ **Active Prototype — Core Storage Engine Implemented**
+> The WAL, segmented block store, memtable, bloom filters, index, and manifest layers are functional. Integration tests cover WAL crash recovery and memtable flush pipelines. The OTLP query layer is under active development.
+
+---
+
+## Quick Start
+
+```bash
+# Build the server and test client
+make build
+
+# Run integration tests
+make test-integration
+
+# Run specific test blocks
+make test-block1   # WAL crash recovery
+make test-block2   # Memtable flush + query
+```
+
+---
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/your-feature`
+3. Follow the existing `internal/` package conventions
+4. Keep ADRs updated for architecture changes
+5. Submit a PR — reference the `docs/architecture/ADR.md` and `docs/reviews/WRITE_PATH_REVIEW.md`
+
+---
+
+## Project Structure
+
+```
+octodb/
+├── cmd/
+│   ├── octodb/          # Main database server
+│   ├── replay_check/    # WAL replay verification tool
+│   └── testclient/     # Integration test client
+├── internal/
+│   ├── bloom/           # Bloom filter implementation
+│   ├── config/          # YAML configuration loader
+│   ├── index/           # Trace index (segment locator)
+│   ├── manifest/        # SST manifest manager
+│   ├── memtable/       # In-memory write buffer
+│   ├── segment/        # Segmented block store
+│   ├── server/         # gRPC + HTTP query layer
+│   ├── store/          # Unified storage orchestrator
+│   └── wal/            # Write-ahead Log
+├── pkg/
+│   └── otelutil/       # OpenTelemetry helpers
+├── tests/
+│   └── integration/    # End-to-end integration tests
+└── docs/               # Architecture docs & roadmap
+```
 
 ---
 
