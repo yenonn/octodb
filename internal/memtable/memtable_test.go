@@ -3,6 +3,7 @@ package memtable
 import (
 	"testing"
 
+	"github.com/google/btree"
 	"github.com/octodb/octodb/pkg/otelutil"
 )
 
@@ -132,4 +133,107 @@ func TestSetSnapshotConsistency(t *testing.T) {
 	}
 
 	s.ClearFlushing()
+}
+
+// ---------------------------------------------------------------------------
+// Tombstone tests (Bug fix: memtable must skip tombstones / empty items)
+// ---------------------------------------------------------------------------
+
+func TestMemtableSkipsTombstones(t *testing.T) {
+	m := New()
+	m.Insert(Key{DType: otelutil.TypeTrace, Key: "a"}, []byte("aaa"))
+	m.InsertTombstone(Key{DType: otelutil.TypeTrace, Key: "b"})
+	m.Insert(Key{DType: otelutil.TypeTrace, Key: "c"}, []byte("ccc"))
+
+	var keys []string
+	var vals []string
+	m.Ascend(func(key Key, value []byte) bool {
+		keys = append(keys, key.Key)
+		vals = append(vals, string(value))
+		return true
+	})
+
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 non-deleted entries, got %d keys=%v", len(keys), keys)
+	}
+	if keys[0] != "a" || keys[1] != "c" {
+		t.Fatalf("unexpected keys: %v", keys)
+	}
+	if vals[0] != "aaa" || vals[1] != "ccc" {
+		t.Fatalf("unexpected values: %v", vals)
+	}
+}
+
+func TestMemtableAscendByTypeSkipsTombstones(t *testing.T) {
+	m := New()
+	m.Insert(Key{DType: otelutil.TypeTrace, Key: "t1"}, []byte("trace1"))
+	m.InsertTombstone(Key{DType: otelutil.TypeTrace, Key: "t2"})
+	m.Insert(Key{DType: otelutil.TypeTrace, Key: "t3"}, []byte("trace3"))
+	m.Insert(Key{DType: otelutil.TypeLog, Key: "l1"}, []byte("log1"))
+
+	var traces []string
+	m.AscendByType(otelutil.TypeTrace, func(key Key, value []byte) bool {
+		traces = append(traces, key.Key)
+		return true
+	})
+	if len(traces) != 2 {
+		t.Fatalf("expected 2 traces, got %d: %v", len(traces), traces)
+	}
+	if traces[0] != "t1" || traces[1] != "t3" {
+		t.Fatalf("unexpected trace order: %v", traces)
+	}
+
+	var logs []string
+	m.AscendByType(otelutil.TypeLog, func(key Key, value []byte) bool {
+		logs = append(logs, key.Key)
+		return true
+	})
+	if len(logs) != 1 || logs[0] != "l1" {
+		t.Fatalf("unexpected logs: %v", logs)
+	}
+}
+
+func TestMemtableSkipsEmptyValue(t *testing.T) {
+	m := New()
+	m.Insert(Key{DType: otelutil.TypeTrace, Key: "a"}, []byte("data"))
+	m.Insert(Key{DType: otelutil.TypeTrace, Key: "b"}, []byte{}) // empty but not Tombstone
+	m.Insert(Key{DType: otelutil.TypeTrace, Key: "c"}, nil)    // nil but not Tombstone
+	m.Insert(Key{DType: otelutil.TypeTrace, Key: "d"}, []byte("more"))
+
+	var keys []string
+	m.Ascend(func(key Key, value []byte) bool {
+		keys = append(keys, key.Key)
+		return true
+	})
+	if len(keys) != 2 {
+		t.Fatalf("expected 2 entries with data, got %d: %v", len(keys), keys)
+	}
+	if keys[0] != "a" || keys[1] != "d" {
+		t.Fatalf("unexpected keys: %v", keys)
+	}
+}
+
+func TestMemtableTombstoneIsNotNil(t *testing.T) {
+	// Ensure that a tombstone has nil Value even though struct field may be zero value.
+	m := New()
+	key := Key{DType: otelutil.TypeTrace, Key: "x"}
+	m.InsertTombstone(key)
+
+	var found bool
+	m.data.Ascend(func(item btree.Item) bool {
+		it := item.(Item)
+		if it.Key.Key == "x" {
+			if !it.Deleted {
+				t.Fatal("expected tombstone flag")
+			}
+			if it.Value != nil {
+				t.Fatalf("expected nil value for tombstone, got %q", it.Value)
+			}
+			found = true
+		}
+		return true
+	})
+	if !found {
+		t.Fatal("tombstone not found")
+	}
 }

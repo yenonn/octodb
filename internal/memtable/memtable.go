@@ -75,17 +75,25 @@ func (m *Memtable) SetSize(n int64) {
 }
 
 // Ascend calls fn for every item in ascending sort key order.
+// Tombstones (Deleted=true) are skipped.
 // Safe for concurrent reads.
 func (m *Memtable) Ascend(fn func(key Key, value []byte) bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	m.data.Ascend(func(item btree.Item) bool {
 		it := item.(Item)
+		if it.Deleted {
+			return true
+		}
+		if it.Value == nil || len(it.Value) == 0 {
+			return true
+		}
 		return fn(it.Key, it.Value)
 	})
 }
 
 // AscendByType calls fn only for items matching the given data type.
+// Tombstones (Deleted=true) are skipped.
 func (m *Memtable) AscendByType(dtype otelutil.DataType, fn func(key Key, value []byte) bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -98,6 +106,12 @@ func (m *Memtable) AscendByType(dtype otelutil.DataType, fn func(key Key, value 
 			if it.Key.DType > dtype {
 				return false
 			}
+			return true
+		}
+		if it.Deleted {
+			return true
+		}
+		if it.Value == nil || len(it.Value) == 0 {
 			return true
 		}
 		return fn(it.Key, it.Value)

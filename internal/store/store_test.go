@@ -1519,10 +1519,11 @@ func BenchmarkWriteTraces(b *testing.B) {
 	ctx := context.Background()
 	now := uint64(time.Now().UnixNano())
 
-	sizes := []int{1, 10, 100}
+	sizes := []int{1, 10, 100, 1000}
 
 	for _, count := range sizes {
 		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			b.ReportAllocs()
 			spans := make([]*tracepb.ResourceSpans, count)
 			for i := range spans {
 				spans[i] = makeTestTrace("bench-svc", fmt.Sprintf("span-%d", i), now)
@@ -1534,6 +1535,7 @@ func BenchmarkWriteTraces(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+			b.ReportMetric(float64(b.N*count)/b.Elapsed().Seconds(), "spans/sec")
 		})
 	}
 }
@@ -1548,34 +1550,39 @@ func BenchmarkConcurrentWrites(b *testing.B) {
 	ctx := context.Background()
 	now := uint64(time.Now().UnixNano())
 
-	concurrency := []int{1, 4, 8, 16}
+	concurrency := []int{1, 4, 8, 16, 32}
+	batchSizes := []int{1, 10, 100}
 
 	for _, goroutines := range concurrency {
-		b.Run(fmt.Sprintf("goroutines=%d", goroutines), func(b *testing.B) {
-			spans := make([]*tracepb.ResourceSpans, 10)
-			for i := range spans {
-				spans[i] = makeTestTrace("bench-svc", fmt.Sprintf("span-%d", i), now)
-			}
+		for _, batchSize := range batchSizes {
+			b.Run(fmt.Sprintf("goroutines=%d_batch=%d", goroutines, batchSize), func(b *testing.B) {
+				b.ReportAllocs()
+				spans := make([]*tracepb.ResourceSpans, batchSize)
+				for i := range spans {
+					spans[i] = makeTestTrace("bench-svc", fmt.Sprintf("span-%d", i), now)
+				}
 
-			b.ResetTimer()
-			b.StopTimer()
+				b.ResetTimer()
+				b.StopTimer()
 
-			var wg sync.WaitGroup
-			for i := 0; i < goroutines; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					for i := 0; i < b.N/goroutines; i++ {
-						if err := st.WriteTraces(ctx, "default", spans); err != nil {
-							b.Fatal(err)
+				var wg sync.WaitGroup
+				for i := 0; i < goroutines; i++ {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						for i := 0; i < b.N/goroutines; i++ {
+							if err := st.WriteTraces(ctx, "default", spans); err != nil {
+								b.Fatal(err)
+							}
 						}
-					}
-				}()
-			}
+					}()
+				}
 
-			b.StartTimer()
-			wg.Wait()
-		})
+				b.StartTimer()
+				wg.Wait()
+				b.ReportMetric(float64(b.N*batchSize)/b.Elapsed().Seconds(), "spans/sec")
+			})
+		}
 	}
 }
 
@@ -1589,10 +1596,11 @@ func BenchmarkWriteLogs(b *testing.B) {
 	ctx := context.Background()
 	now := uint64(time.Now().UnixNano())
 
-	sizes := []int{1, 10, 100}
+	sizes := []int{1, 10, 100, 1000}
 
 	for _, count := range sizes {
 		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			b.ReportAllocs()
 			logs := make([]*logspb.ResourceLogs, count)
 			for i := range logs {
 				logs[i] = makeTestLog("bench-svc", fmt.Sprintf("log-%d", i), logspb.SeverityNumber_SEVERITY_NUMBER_INFO, nil, nil, now)
@@ -1604,6 +1612,7 @@ func BenchmarkWriteLogs(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+			b.ReportMetric(float64(b.N*count)/b.Elapsed().Seconds(), "logs/sec")
 		})
 	}
 }
@@ -1618,10 +1627,11 @@ func BenchmarkWriteMetrics(b *testing.B) {
 	ctx := context.Background()
 	now := uint64(time.Now().UnixNano())
 
-	sizes := []int{1, 10, 100}
+	sizes := []int{1, 10, 100, 1000}
 
 	for _, count := range sizes {
 		b.Run(fmt.Sprintf("count=%d", count), func(b *testing.B) {
+			b.ReportAllocs()
 			metrics := make([]*metricspb.ResourceMetrics, count)
 			for i := range metrics {
 				metrics[i] = makeTestMetric("bench-svc", fmt.Sprintf("metric-%d", i), float64(i), now)
@@ -1633,6 +1643,7 @@ func BenchmarkWriteMetrics(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+			b.ReportMetric(float64(b.N*count)/b.Elapsed().Seconds(), "metrics/sec")
 		})
 	}
 }
@@ -1659,6 +1670,7 @@ func BenchmarkWriteMixedSignals(b *testing.B) {
 
 	for _, c := range counts {
 		b.Run(fmt.Sprintf("traces=%d_logs=%d_metrics=%d", c.traces, c.logs, c.metrics), func(b *testing.B) {
+			b.ReportAllocs()
 			traces := make([]*tracepb.ResourceSpans, c.traces)
 			logs := make([]*logspb.ResourceLogs, c.logs)
 			metrics := make([]*metricspb.ResourceMetrics, c.metrics)
@@ -1685,7 +1697,160 @@ func BenchmarkWriteMixedSignals(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
+			total := b.N * (c.traces + c.logs + c.metrics)
+			b.ReportMetric(float64(total)/b.Elapsed().Seconds(), "records/sec")
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests for write-path bug fixes
+// ---------------------------------------------------------------------------
+
+// TestDeleteTracesAfterFlush verifies that deleted traces stay gone
+// after the store is closed and reopened (WAL tombstone survives replay).
+func TestDeleteTracesAfterFlush(t *testing.T) {
+	st, dataDir := setupTestStore(t)
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+	span := makeTestTrace("del-svc", "del-span", now)
+	_ = st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span})
+	if err := st.DeleteTraces(ctx, "default", TraceReadRequest{TenantID: "default", Service: "del-svc"}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	st.Close()
+
+	st2 := reopenStore(t, dataDir)
+	defer st2.Close()
+
+	result, err := st2.ReadTraces(ctx, TraceReadRequest{TenantID: "default", Service: "del-svc"})
+	if err != nil {
+		t.Fatalf("read post-reopen: %v", err)
+	}
+	if len(result) != 0 {
+		t.Fatalf("expected 0 traces after delete+reopen, got %d", len(result))
+	}
+}
+
+// TestCompactionRebuildsTraceIndex ensures ReadTraceByID works on compacted segments.
+func TestCompactionRebuildsTraceIndex(t *testing.T) {
+	st, dataDir := setupTestStore(t)
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+	traceID := hex.EncodeToString([]byte("1234567890abcdef1234567890abcdef"))
+
+	// Force two flush-capacity batches so we have 2 segments.
+	for j := 0; j < 2; j++ {
+		for i := 0; i < 15; i++ {
+			span := makeTestTrace("comp-idx-svc", fmt.Sprintf("span-%d-%d", j, i), now+uint64(j*1000+i))
+			span.ScopeSpans[0].Spans[0].TraceId = []byte("1234567890abcdef1234567890abcdef")
+			_ = st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span})
+		}
+		_ = st.Close()
+		st, _ = NewBlock2Store(dataDir)
+	}
+	defer st.Close()
+
+	// Verify we have at least 2 records before compaction.
+	recordsBefore := st.(*block2Store).traceBundle.man.AllRecords()
+	if len(recordsBefore) < 2 {
+		t.Fatalf("expected at least 2 records before compaction, got %d", len(recordsBefore))
+	}
+
+	s := st.(*block2Store)
+	if err := s.compactBundle(s.traceBundle); err != nil {
+		t.Fatalf("compaction: %v", err)
+	}
+
+	result, err := s.ReadTraceByID(ctx, "default", traceID)
+	if err != nil {
+		t.Fatalf("ReadTraceByID: %v", err)
+	}
+	if len(result) != 30 {
+		t.Fatalf("expected 30 spans after compaction, got %d", len(result))
+	}
+}
+
+// TestFlushIdleSizeWithConcurrentWrites checks no data race on signalBundle.lastWrite.
+func TestFlushIdleSizeWithConcurrentWrites(t *testing.T) {
+	dir := t.TempDir()
+	dataDir := filepath.Join(dir, "data")
+	st, err := NewBlock2Store(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+	var wg sync.WaitGroup
+
+	// Spawn concurrent writers.
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				span := makeTestTrace(fmt.Sprintf("svc-%d", idx), fmt.Sprintf("span-%d", j), now+uint64(j))
+				_ = st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span})
+			}
+		}(i)
+	}
+
+	// Spawn concurrent flusher triggers (via flushIdleSize).
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s2 := st.(*block2Store)
+		for i := 0; i < 50; i++ {
+			_ = s2.traceBundle.flushIdleSize(64 * 1024)
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	wg.Wait()
+}
+
+// TestDeleteLogsAndMetrics tests that deletion works for logs and metrics too.
+func TestDeleteLogsAndMetricsPostFlush(t *testing.T) {
+	st, dataDir := setupTestStore(t)
+
+	ctx := context.Background()
+	now := uint64(time.Now().UnixNano())
+	lg := makeTestLog("log-svc", "msg", logspb.SeverityNumber_SEVERITY_NUMBER_ERROR, nil, nil, now)
+	m := makeTestMetric("metric-svc", "cpu", 1.0, now)
+	_ = st.WriteLogs(ctx, "default", []*logspb.ResourceLogs{lg})
+	_ = st.WriteMetrics(ctx, "default", []*metricspb.ResourceMetrics{m})
+	if err := st.DeleteLogs(ctx, "default", LogReadRequest{TenantID: "default", Service: "log-svc"}); err != nil {
+		t.Fatalf("delete logs: %v", err)
+	}
+	if err := st.DeleteMetrics(ctx, "default", MetricReadRequest{TenantID: "default", Service: "metric-svc"}); err != nil {
+		t.Fatalf("delete metrics: %v", err)
+	}
+	st.Close()
+
+	st2 := reopenStore(t, dataDir)
+	defer st2.Close()
+
+	logs, err := st2.ReadLogs(ctx, LogReadRequest{TenantID: "default", Service: "log-svc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("expected 0 logs after delete+reopen, got %d", len(logs))
+	}
+	metrics, err := st2.ReadMetrics(ctx, MetricReadRequest{TenantID: "default", Service: "metric-svc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(metrics) != 0 {
+		t.Fatalf("expected 0 metrics after delete+reopen, got %d", len(metrics))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// End of store_test.go
+// ---------------------------------------------------------------------------
 

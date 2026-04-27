@@ -184,11 +184,20 @@ func (m *Manager) WriteCheckpoint(walFile string, offset int64) error {
 
 	cp := fmt.Sprintf("%s:%d", walFile, offset)
 
-	// Atomic write via temp file + rename.
+	// Atomic write via temp file + rename with fsync.
 	tmpPath := m.checkpointPath + ".tmp"
 	if err := os.WriteFile(tmpPath, []byte(cp), 0644); err != nil {
 		return fmt.Errorf("manifest checkpoint write: %w", err)
 	}
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		return fmt.Errorf("manifest checkpoint open tmp: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("manifest checkpoint fsync: %w", err)
+	}
+	f.Close()
 	if err := os.Rename(tmpPath, m.checkpointPath); err != nil {
 		return fmt.Errorf("manifest checkpoint rename: %w", err)
 	}

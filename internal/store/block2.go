@@ -100,6 +100,7 @@ type block2Store struct {
 
 	stopFlush chan struct{}
 	flushDone sync.WaitGroup
+	closeOnce sync.Once
 }
 
 // NewBlock2Store creates a store with test-friendly defaults (1KB flush threshold).
@@ -526,7 +527,10 @@ func (b *signalBundle) insert(key memtable.Key, value []byte) {
 
 // flushIdleSize returns the effective size for flush decisions.
 // If idle timeout has elapsed, returns the threshold to force a flush.
+// Thread-safe (read-locks bundle.mu).
 func (b *signalBundle) flushIdleSize(threshold int64) int64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
 	if time.Since(b.lastWrite) > MemtableMaxIdleFlush && b.set.ActiveSize() > 0 {
 		return threshold
 	}
@@ -897,17 +901,19 @@ func (s *block2Store) logKeyMatches(rl logspb.ResourceLogs, req LogReadRequest) 
 // ---------------------------------------------------------------------------
 
 func (s *block2Store) Close() error {
-	close(s.stopFlush)
-	s.flushDone.Wait()
-	if s.traceBundle != nil {
-		_ = s.traceBundle.wal.Close()
-	}
-	if s.logBundle != nil {
-		_ = s.logBundle.wal.Close()
-	}
-	if s.metricBundle != nil {
-		_ = s.metricBundle.wal.Close()
-	}
+	s.closeOnce.Do(func() {
+		close(s.stopFlush)
+		s.flushDone.Wait()
+		if s.traceBundle != nil {
+			_ = s.traceBundle.wal.Close()
+		}
+		if s.logBundle != nil {
+			_ = s.logBundle.wal.Close()
+		}
+		if s.metricBundle != nil {
+			_ = s.metricBundle.wal.Close()
+		}
+	})
 	return nil
 }
 
@@ -989,8 +995,9 @@ func (s *block2Store) DeleteTraces(ctx context.Context, tenantID string, req Tra
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// Find matching traces and insert tombstones.
+	// Find matching keys first (holding RLock via Snapshot), then WAL + tombstone.
 	active, flushing := b.set.Snapshot()
+	var keysToDelete []memtable.Key
 	for _, tbl := range []*memtable.Memtable{active, flushing} {
 		if tbl == nil {
 			continue
@@ -1003,15 +1010,24 @@ func (s *block2Store) DeleteTraces(ctx context.Context, tenantID string, req Tra
 			if !s.traceKeyMatches(rs, req) {
 				return true
 			}
-			// Write tombstone to WAL.
-			ts := fmt.Sprintf(`{"deleted":true,"key":%q}`, key.Key)
-			_ = s.traceBundle.wal.Append([]byte(ts))
-			// Insert tombstone into memtable.
-			s.traceBundle.set.InsertTombstone(key)
+			keysToDelete = append(keysToDelete, key)
 			return true
 		})
 	}
-	_ = s.traceBundle.wal.Sync()
+
+	// WAL-append tombstones first, then memtable.
+	for _, key := range keysToDelete {
+		ts := fmt.Sprintf(`{"deleted":true,"key":%q}`, key.Key)
+		if err := s.traceBundle.wal.Append([]byte(ts)); err != nil {
+			return fmt.Errorf("deletetraces: wal append: %w", err)
+		}
+	}
+	if err := s.traceBundle.wal.Sync(); err != nil {
+		return fmt.Errorf("deletetraces: wal sync: %w", err)
+	}
+	for _, key := range keysToDelete {
+		s.traceBundle.set.InsertTombstone(key)
+	}
 	return nil
 }
 
@@ -1021,6 +1037,7 @@ func (s *block2Store) DeleteLogs(ctx context.Context, tenantID string, req LogRe
 	defer b.mu.Unlock()
 
 	active, flushing := b.set.Snapshot()
+	var keysToDelete []memtable.Key
 	for _, tbl := range []*memtable.Memtable{active, flushing} {
 		if tbl == nil {
 			continue
@@ -1033,13 +1050,23 @@ func (s *block2Store) DeleteLogs(ctx context.Context, tenantID string, req LogRe
 			if !s.logKeyMatches(rl, req) {
 				return true
 			}
-			ts := fmt.Sprintf(`{"deleted":true,"key":%q}`, key.Key)
-			_ = s.logBundle.wal.Append([]byte(ts))
-			s.logBundle.set.InsertTombstone(key)
+			keysToDelete = append(keysToDelete, key)
 			return true
 		})
 	}
-	_ = s.logBundle.wal.Sync()
+
+	for _, key := range keysToDelete {
+		ts := fmt.Sprintf(`{"deleted":true,"key":%q}`, key.Key)
+		if err := s.logBundle.wal.Append([]byte(ts)); err != nil {
+			return fmt.Errorf("deletelogs: wal append: %w", err)
+		}
+	}
+	if err := s.logBundle.wal.Sync(); err != nil {
+		return fmt.Errorf("deletelogs: wal sync: %w", err)
+	}
+	for _, key := range keysToDelete {
+		s.logBundle.set.InsertTombstone(key)
+	}
 	return nil
 }
 
@@ -1049,6 +1076,7 @@ func (s *block2Store) DeleteMetrics(ctx context.Context, tenantID string, req Me
 	defer b.mu.Unlock()
 
 	active, flushing := b.set.Snapshot()
+	var keysToDelete []memtable.Key
 	for _, tbl := range []*memtable.Memtable{active, flushing} {
 		if tbl == nil {
 			continue
@@ -1061,13 +1089,23 @@ func (s *block2Store) DeleteMetrics(ctx context.Context, tenantID string, req Me
 			if !s.metricKeyMatches(rm, req) {
 				return true
 			}
-			ts := fmt.Sprintf(`{"deleted":true,"key":%q}`, key.Key)
-			_ = s.metricBundle.wal.Append([]byte(ts))
-			s.metricBundle.set.InsertTombstone(key)
+			keysToDelete = append(keysToDelete, key)
 			return true
 		})
 	}
-	_ = s.metricBundle.wal.Sync()
+
+	for _, key := range keysToDelete {
+		ts := fmt.Sprintf(`{"deleted":true,"key":%q}`, key.Key)
+		if err := s.metricBundle.wal.Append([]byte(ts)); err != nil {
+			return fmt.Errorf("deletemetrics: wal append: %w", err)
+		}
+	}
+	if err := s.metricBundle.wal.Sync(); err != nil {
+		return fmt.Errorf("deletemetrics: wal sync: %w", err)
+	}
+	for _, key := range keysToDelete {
+		s.metricBundle.set.InsertTombstone(key)
+	}
 	return nil
 }
 
@@ -1126,6 +1164,7 @@ func (s *block2Store) cleanupWALTombstones(b *signalBundle) {
 }
 
 // compactBundle merges adjacent segments and rewrites manifest.
+// Rebuilds trace index by merging old segments' sidecar indexes.
 func (s *block2Store) compactBundle(b *signalBundle) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1138,7 +1177,8 @@ func (s *block2Store) compactBundle(b *signalBundle) error {
 	// Simple heuristic: merge segments 0+1.
 	oldRecs := records[:2]
 
-	mergePath := filepath.Join(s.dataDir, b.subdir, fmt.Sprintf("sst-%08d.pb", b.man.NextSequence()))
+	mergeSeq := b.man.NextSequence()
+	mergePath := filepath.Join(s.dataDir, b.subdir, fmt.Sprintf("sst-%08d.pb", mergeSeq))
 	mergeSeg, err := segment.Create(mergePath)
 	if err != nil {
 		return fmt.Errorf("compact: create segment: %w", err)
@@ -1147,7 +1187,7 @@ func (s *block2Store) compactBundle(b *signalBundle) error {
 	var bloomKeys []string
 	var minKey, maxKey manifest.SortKey
 	var first bool
-	// TODO: rebuild trace index from old segments' trace.index files.
+	mergedTraceIndex := index.SegmentTraceIndex{Offsets: make(map[string][]int64)}
 
 	for _, rec := range oldRecs {
 		segPath := filepath.Join(s.dataDir, b.subdir, rec.SegmentFile)
@@ -1163,14 +1203,29 @@ func (s *block2Store) compactBundle(b *signalBundle) error {
 			if len(data) == 0 {
 				continue
 			}
-			// Skip tombstones in compaction.
-			if len(data) >= 9 {
-				if bytes.HasPrefix(data, []byte("{'deleted':true")) {
+			// Skip tombstones in compaction (JSON text double-quoted format).
+			if len(data) >= 11 {
+				if bytes.HasPrefix(data, []byte(`{"deleted":true`)) {
 					continue
 				}
 			}
-			_ = mergeSeg.Append(data)
+			offset, _ := mergeSeg.CurrentOffset()
+			if err := mergeSeg.Append(data); err != nil {
+				_ = seg.Close()
+				return fmt.Errorf("compact: append: %w", err)
+			}
 			bloomKeys = append(bloomKeys, extractServiceBloomKey(string(data)))
+
+			// Rebuild trace index by extracting trace_id from the record.
+			var traceID string
+			if b.subdir == "traces" {
+				traceID = s.extractTraceIDFromData(data)
+			} else if b.subdir == "logs" {
+				traceID = s.extractLogTraceID(data)
+			}
+			if traceID != "" && traceID != "none" {
+				mergedTraceIndex.Offsets[traceID] = append(mergedTraceIndex.Offsets[traceID], offset)
+			}
 		}
 		if len(seg.Footer().Blocks) > 0 {
 			for _, blk := range seg.Footer().Blocks {
@@ -1189,12 +1244,17 @@ func (s *block2Store) compactBundle(b *signalBundle) error {
 				}
 			}
 		}
-		// TODO: rebuild trace index from old segments' trace.index files.
 		_ = seg.Close()
 	}
 
 	if err := mergeSeg.Close(""); err != nil {
 		return fmt.Errorf("compact: close segment: %w", err)
+	}
+
+	// Save rebuilt trace index.
+	mergeIdxPath := mergePath + ".trace.index"
+	if err := mergedTraceIndex.Save(mergeIdxPath); err != nil {
+		return fmt.Errorf("compact: save trace index: %w", err)
 	}
 
 	bf := bloom.Build(bloomKeys, 0.01)
@@ -1210,7 +1270,7 @@ func (s *block2Store) compactBundle(b *signalBundle) error {
 	}
 
 	newRec := manifest.Record{
-		Sequence:      b.man.NextSequence(),
+		Sequence:      mergeSeq,
 		SegmentFile:   filepath.Base(mergePath),
 		BloomFile:     filepath.Base(bloomPath),
 		WALCheckpoint: "compact",
@@ -1227,6 +1287,14 @@ func (s *block2Store) compactBundle(b *signalBundle) error {
 	if err := b.man.CompactRecords(oldSeqs, []manifest.Record{newRec}); err != nil {
 		return fmt.Errorf("compact: manifest rewrite: %w", err)
 	}
+
+	// Update locator: remove old sequences, add new merged one.
+	for _, traceID := range mergedTraceIndex.Offsets {
+		_ = traceID // unused loop variable placeholder
+		break
+	}
+	b.locator.RemoveAll(oldSeqs)
+	b.locator.Merge(mergeSeq, &mergedTraceIndex)
 
 	// Remove old files.
 	for _, rec := range oldRecs {

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -17,14 +18,33 @@ type SegmentTraceIndex struct {
 	Offsets map[string][]int64 `json:"offsets"`
 }
 
-// Save writes a SegmentTraceIndex to a JSON file.
+// Save writes a SegmentTraceIndex to a JSON file atomically with fsync.
 func (idx *SegmentTraceIndex) Save(path string) error {
 	data, err := json.Marshal(idx)
 	if err != nil {
 		return fmt.Errorf("trace index marshal: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
-		return fmt.Errorf("trace index save: %w", err)
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("trace index write: %w", err)
+	}
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		return fmt.Errorf("trace index open tmp: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("trace index fsync: %w", err)
+	}
+	f.Close()
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("trace index rename: %w", err)
+	}
+	// Sync parent dir for rename durability.
+	dir := filepath.Dir(path)
+	if df, err := os.Open(dir); err == nil {
+		_ = df.Sync()
+		_ = df.Close()
 	}
 	return nil
 }
@@ -95,6 +115,20 @@ func (t *TraceLocator) Merge(seq int64, idx *SegmentTraceIndex) {
 			t.index[traceID] = make(map[int64]struct{})
 		}
 		t.index[traceID][seq] = struct{}{}
+	}
+}
+
+// RemoveAll drops all segment sequences listed from the locator (used during compaction).
+func (t *TraceLocator) RemoveAll(seqs []int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for traceID, set := range t.index {
+		for _, seq := range seqs {
+			delete(set, seq)
+		}
+		if len(set) == 0 {
+			delete(t.index, traceID)
+		}
 	}
 }
 

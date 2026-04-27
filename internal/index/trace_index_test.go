@@ -131,3 +131,80 @@ func TestTraceLocatorMergeIdempotent(t *testing.T) {
 		t.Fatalf("expected 1 unique seq for t1 after merge, got %d", len(seqs))
 	}
 }
+
+func TestTraceLocatorRemoveAll(t *testing.T) {
+	loc := NewTraceLocator()
+	loc.Add("trace-a", 1)
+	loc.Add("trace-a", 2)
+	loc.Add("trace-b", 2)
+	loc.Add("trace-c", 3)
+
+	loc.RemoveAll([]int64{1, 2})
+
+	if loc.Size() != 1 {
+		t.Fatalf("expected size 1 after remove, got %d", loc.Size())
+	}
+	seqs := loc.Find("trace-c")
+	if len(seqs) != 1 || seqs[0] != 3 {
+		t.Fatalf("expected trace-c in seq 3, got %v", seqs)
+	}
+	if loc.Find("trace-a") != nil {
+		t.Fatal("expected trace-a removed")
+	}
+	if loc.Find("trace-b") != nil {
+		t.Fatal("expected trace-b removed")
+	}
+}
+
+// TestTraceLocatorRemoveAllPartial verifies RemoveAll with some non-existent seqs.
+func TestTraceLocatorRemoveAllPartial(t *testing.T) {
+	loc := NewTraceLocator()
+	loc.Add("x", 10)
+	loc.Add("x", 20)
+
+	// Remove seq that doesn't exist among other existing seqs.
+	loc.RemoveAll([]int64{99})
+	if loc.Size() != 1 {
+		t.Fatalf("expected size 1, got %d", loc.Size())
+	}
+
+	loc.RemoveAll([]int64{10})
+	if loc.Size() != 1 {
+		t.Fatalf("expected size 1 after partial remove, got %d", loc.Size())
+	}
+	seqs := loc.Find("x")
+	if len(seqs) != 1 || seqs[0] != 20 {
+		t.Fatalf("expected seq 20, got %v", seqs)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Index Save atomicity tests
+// ---------------------------------------------------------------------------
+
+func TestSegmentTraceIndexSaveIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "atomic.trace.index")
+
+	idx := &SegmentTraceIndex{Offsets: map[string][]int64{
+		"aaa": {0, 100},
+	}}
+	if err := idx.Save(path); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Verify no temp file left behind.
+	tmpPath := path + ".tmp"
+	if _, err := os.Stat(tmpPath); !os.IsNotExist(err) {
+		t.Fatalf("temp file should be removed after atomic save: %s", tmpPath)
+	}
+
+	// Verify file exists and is valid JSON.
+	loaded, err := LoadSegmentTraceIndex(path)
+	if err != nil {
+		t.Fatalf("load after save: %v", err)
+	}
+	if len(loaded.Offsets) != 1 {
+		t.Fatalf("expected 1 offset, got %d", len(loaded.Offsets))
+	}
+}
