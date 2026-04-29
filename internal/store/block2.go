@@ -1305,10 +1305,6 @@ func (s *block2Store) compactBundle(b *signalBundle) error {
 	}
 
 	// Update locator: remove old sequences, add new merged one.
-	for _, traceID := range mergedTraceIndex.Offsets {
-		_ = traceID // unused loop variable placeholder
-		break
-	}
 	b.locator.RemoveAll(oldSeqs)
 	b.locator.Merge(mergeSeq, &mergedTraceIndex)
 
