@@ -1,6 +1,16 @@
 # OctoDB Write Path - Known Limitations TODO
 
-**Last Updated:** 2026-04-26
+**Last Updated:** 2026-04-29
+
+## Resolved Today (2026-04-29)
+
+### ✅ ADR-004: Per-Tenant Signal Bundles with Lifecycle Management
+- **Addresses:** #5 (Hardcoded "default" Tenant), #8 (Segment fsync), #10 (Trace Index in Compact)
+- **Status:** Design approved. Implementation scheduled for tomorrow.
+- **Approach:** Each tenant gets their own `signalBundle` per signal (traces/logs/metrics) with Active/Parked/Cold lifecycle states. This replaces the single shared bundle.
+- **Impact:** True physical isolation, per-tenant backup/restore, bounded memory/FDs, and closed segment-level tenant leakage.
+
+---
 
 ## High Priority
 
