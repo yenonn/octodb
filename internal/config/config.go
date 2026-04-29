@@ -10,12 +10,28 @@ import (
 // Config holds OctoDB runtime configuration.
 type Config struct {
 	Server struct {
-		GRPCAddr               string `yaml:"grpc_addr"`
-		MemtableFlushThreshold int64  `yaml:"memtable_flush_threshold"`
+		GRPCAddr               string              `yaml:"grpc_addr"`
+		MemtableFlushThreshold int64               `yaml:"memtable_flush_threshold"`
 	} `yaml:"server"`
 	WAL struct {
 		Path string `yaml:"path"`
 	} `yaml:"wal"`
+	TenantResolution TenantResolutionConfig `yaml:"tenant_resolution"`
+}
+
+// TenantResolutionConfig controls how tenant identity is derived from OTel Resource attributes.
+type TenantResolutionConfig struct {
+	Strategy string   `yaml:"strategy"`
+	Attrs    []string `yaml:"attrs"`
+	Default  string   `yaml:"default"`
+}
+
+func defaultTenantResolution() TenantResolutionConfig {
+	return TenantResolutionConfig{
+		Strategy: "attribute_based",
+		Attrs:    []string{"tenant.id", "tenant_id", "k8s.namespace.name"},
+		Default:  "default",
+	}
 }
 
 // Load reads a YAML config file, falls back to defaults, and applies env overrides.
@@ -26,6 +42,7 @@ func Load(path string) (*Config, error) {
 	cfg.Server.GRPCAddr = ":4317"
 	cfg.Server.MemtableFlushThreshold = 64 * 1024 * 1024 // 64 MB
 	cfg.WAL.Path = "octodb.wal"
+	cfg.TenantResolution = defaultTenantResolution()
 
 	data, err := os.ReadFile(path)
 	if err != nil {

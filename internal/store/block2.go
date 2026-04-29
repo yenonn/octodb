@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
 	metricspb "go.opentelemetry.io/proto/otlp/metrics/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
@@ -384,14 +385,19 @@ func (s *block2Store) extractTraceSortKey(raw []byte) (memtable.Key, []byte) {
 	if err := proto.Unmarshal(raw, &rs); err != nil {
 		return memtable.Key{}, nil
 	}
-	svc := ""
+	svc, tenantID := "", ""
 	if rs.Resource != nil {
-		for _, attr := range rs.Resource.Attributes {
-			if attr.Key == "service.name" {
-				svc = attr.Value.GetStringValue()
-				break
-			}
+		svc = stringAttr(rs.Resource.Attributes, "service.name")
+		tenantID = stringAttr(rs.Resource.Attributes, "tenant.id")
+		if tenantID == "" {
+			tenantID = stringAttr(rs.Resource.Attributes, "tenant_id")
 		}
+		if tenantID == "" {
+			tenantID = stringAttr(rs.Resource.Attributes, "k8s.namespace.name")
+		}
+	}
+	if tenantID == "" {
+		tenantID = "default"
 	}
 	var timeNano uint64
 	var spanID string
@@ -403,7 +409,7 @@ func (s *block2Store) extractTraceSortKey(raw []byte) (memtable.Key, []byte) {
 	if spanID == "" {
 		spanID = "0000000000000000"
 	}
-	key := otelutil.TraceSortKey{TenantID: "default", Service: svc, TimeNano: timeNano, SpanID: spanID}
+	key := otelutil.TraceSortKey{TenantID: tenantID, Service: svc, TimeNano: timeNano, SpanID: spanID}
 	return memtable.Key{DType: otelutil.TypeTrace, Key: key.Key()}, raw
 }
 
@@ -427,14 +433,19 @@ func (s *block2Store) extractLogSortKey(raw []byte) (memtable.Key, []byte) {
 	if err := proto.Unmarshal(raw, &rl); err != nil {
 		return memtable.Key{}, nil
 	}
-	svc := ""
+	svc, tenantID := "", ""
 	if rl.Resource != nil {
-		for _, attr := range rl.Resource.Attributes {
-			if attr.Key == "service.name" {
-				svc = attr.Value.GetStringValue()
-				break
-			}
+		svc = stringAttr(rl.Resource.Attributes, "service.name")
+		tenantID = stringAttr(rl.Resource.Attributes, "tenant.id")
+		if tenantID == "" {
+			tenantID = stringAttr(rl.Resource.Attributes, "tenant_id")
 		}
+		if tenantID == "" {
+			tenantID = stringAttr(rl.Resource.Attributes, "k8s.namespace.name")
+		}
+	}
+	if tenantID == "" {
+		tenantID = "default"
 	}
 	var timeNano uint64
 	var traceID string
@@ -454,7 +465,7 @@ func (s *block2Store) extractLogSortKey(raw []byte) (memtable.Key, []byte) {
 	if logID == "" {
 		logID = "none"
 	}
-	key := otelutil.LogSortKey{TenantID: "default", Service: svc, TimeNano: timeNano, TraceID: traceID, LogID: logID}
+	key := otelutil.LogSortKey{TenantID: tenantID, Service: svc, TimeNano: timeNano, TraceID: traceID, LogID: logID}
 	return memtable.Key{DType: otelutil.TypeLog, Key: key.Key()}, raw
 }
 
@@ -478,14 +489,19 @@ func (s *block2Store) extractMetricSortKey(raw []byte) (memtable.Key, []byte) {
 	if err := proto.Unmarshal(raw, &rm); err != nil {
 		return memtable.Key{}, nil
 	}
-	svc := ""
+	svc, tenantID := "", ""
 	if rm.Resource != nil {
-		for _, attr := range rm.Resource.Attributes {
-			if attr.Key == "service.name" {
-				svc = attr.Value.GetStringValue()
-				break
-			}
+		svc = stringAttr(rm.Resource.Attributes, "service.name")
+		tenantID = stringAttr(rm.Resource.Attributes, "tenant.id")
+		if tenantID == "" {
+			tenantID = stringAttr(rm.Resource.Attributes, "tenant_id")
 		}
+		if tenantID == "" {
+			tenantID = stringAttr(rm.Resource.Attributes, "k8s.namespace.name")
+		}
+	}
+	if tenantID == "" {
+		tenantID = "default"
 	}
 	var timeNano uint64
 	var metricName string
@@ -515,7 +531,7 @@ func (s *block2Store) extractMetricSortKey(raw []byte) (memtable.Key, []byte) {
 	if metricName == "" {
 		metricName = "none"
 	}
-	key := otelutil.MetricSortKey{TenantID: "default", Service: svc, MetricName: metricName, TimeNano: timeNano}
+	key := otelutil.MetricSortKey{TenantID: tenantID, Service: svc, MetricName: metricName, TimeNano: timeNano}
 	return memtable.Key{DType: otelutil.TypeMetric, Key: key.Key()}, raw
 }
 
@@ -1609,4 +1625,18 @@ func (s *block2Store) metricKeyMatches(rm metricspb.ResourceMetrics, req MetricR
 		return false
 	}
 	return true
+}
+
+// stringAttr extracts the first string-valued attribute matching key.
+func stringAttr(attrs []*commonpb.KeyValue, key string) string {
+	for _, attr := range attrs {
+		if attr.Key == key {
+			if v := attr.Value; v != nil {
+				if s, ok := v.Value.(*commonpb.AnyValue_StringValue); ok {
+					return s.StringValue
+				}
+			}
+		}
+	}
+	return ""
 }

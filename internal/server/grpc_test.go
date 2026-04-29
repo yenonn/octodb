@@ -18,6 +18,7 @@ import (
 	grpcpeer "google.golang.org/grpc/peer"
 
 	"github.com/octodb/octodb/internal/store"
+	"github.com/octodb/octodb/internal/tenant"
 )
 
 func setupStore(t *testing.T) store.Store {
@@ -34,7 +35,7 @@ func setupStore(t *testing.T) store.Store {
 
 func TestTraceServerExportWithPeer(t *testing.T) {
 	st := setupStore(t)
-	srv := NewTraceServer(st)
+	srv := NewTraceServer(st, tenant.Resolver{})
 
 	// Create a context with peer information.
 	ctx := grpcpeer.NewContext(context.Background(), &grpcpeer.Peer{
@@ -75,7 +76,7 @@ func TestTraceServerExportWithPeer(t *testing.T) {
 
 func TestLogServerExportWithPeer(t *testing.T) {
 	st := setupStore(t)
-	srv := NewLogServer(st)
+	srv := NewLogServer(st, tenant.Resolver{})
 
 	ctx := grpcpeer.NewContext(context.Background(), &grpcpeer.Peer{
 		Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345},
@@ -114,7 +115,7 @@ func TestLogServerExportWithPeer(t *testing.T) {
 
 func TestMetricServerExportWithPeer(t *testing.T) {
 	st := setupStore(t)
-	srv := NewMetricServer(st)
+	srv := NewMetricServer(st, tenant.Resolver{})
 
 	ctx := grpcpeer.NewContext(context.Background(), &grpcpeer.Peer{
 		Addr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 12345},
@@ -159,7 +160,7 @@ func TestMetricServerExportWithPeer(t *testing.T) {
 
 func TestTraceServerExport(t *testing.T) {
 	st := setupStore(t)
-	srv := NewTraceServer(st)
+	srv := NewTraceServer(st, tenant.Resolver{})
 
 	req := &collectortrace.ExportTraceServiceRequest{
 		ResourceSpans: []*tracepb.ResourceSpans{
@@ -195,7 +196,7 @@ func TestTraceServerExport(t *testing.T) {
 
 func TestLogServerExport(t *testing.T) {
 	st := setupStore(t)
-	srv := NewLogServer(st)
+	srv := NewLogServer(st, tenant.Resolver{})
 
 	req := &collectorlogs.ExportLogsServiceRequest{
 		ResourceLogs: []*logspb.ResourceLogs{
@@ -231,7 +232,7 @@ func TestLogServerExport(t *testing.T) {
 
 func TestMetricServerExport(t *testing.T) {
 	st := setupStore(t)
-	srv := NewMetricServer(st)
+	srv := NewMetricServer(st, tenant.Resolver{})
 
 	req := &collectormetrics.ExportMetricsServiceRequest{
 		ResourceMetrics: []*metricspb.ResourceMetrics{
@@ -276,6 +277,6 @@ func TestMetricServerExport(t *testing.T) {
 func TestRegisterAll(t *testing.T) {
 	st := setupStore(t)
 	s := grpc.NewServer()
-	RegisterAll(s, st)
+	RegisterAll(s, st, tenant.Resolver{})
 	s.Stop()
 }

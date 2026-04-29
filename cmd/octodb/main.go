@@ -14,6 +14,7 @@ import (
 	"github.com/octodb/octodb/internal/config"
 	"github.com/octodb/octodb/internal/server"
 	"github.com/octodb/octodb/internal/store"
+	"github.com/octodb/octodb/internal/tenant"
 )
 
 func main() {
@@ -48,7 +49,12 @@ func main() {
 	}
 
 	grpcServer := grpc.NewServer()
-	server.RegisterAll(grpcServer, st)
+	resolver := tenant.Resolver{
+		Strategy: cfg.TenantResolution.Strategy,
+		Attrs:    cfg.TenantResolution.Attrs,
+		Default:  cfg.TenantResolution.Default,
+	}
+	server.RegisterAll(grpcServer, st, resolver)
 
 	go func() {
 		log.Printf("OctoDB starting — gRPC on %s | data at octodb-data", cfg.Server.GRPCAddr)
