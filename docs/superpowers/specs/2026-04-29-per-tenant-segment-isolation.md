@@ -1,9 +1,9 @@
-# ADR-004: Per-Tenant Signal Bundles with Lifecycle Management
+# ADR-008: Per-Tenant Signal Bundles with Lifecycle Management
 
 **Status:** Approved  
 **Date:** 2026-04-29  
 **Driver:** Need strict tenant isolation in multi-tenant SaaS platform (1K–10K tenants)  
-**Replaces/Updates:** ADR-002 (Block 2 Storage), ADR-003 (Tent Resolution)  
+**Updates:** ADR-003 (Tenant Resolution), ADR-002 (Block 2 Storage)  
 
 ---
 

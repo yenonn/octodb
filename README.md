@@ -159,8 +159,8 @@ tenant: team-sre
 
 | Phase | Status | Description |
 |-------|--------|-----------|
-| **Phase 1 — Go Prototype** | ✅ **Complete** | Core storage engine (WAL, segmented block store, memtable, bloom filters, index, manifest) implemented in Go. Integration tests validate WAL crash recovery and memtable flush pipelines. Postgres backend dropped in favor of native append-only storage. |
-| **Phase 2 — Storage Design** | 🔄 **In Progress** | Native append-only format with two-level index proven. Query layer (gRPC / HTTP) scaffolded with Trace, Log, and Metric read paths. OTLP receiver and Block 2 query tests under active development. |
+| **Phase 1 — Go Prototype** | 🔄 **In Progress** | Native append-only storage engine implemented. Multi-tenant isolation (ADR-008) designed for tomorrow. |
+| **Phase 2 — Storage Design** | ⏳ **Pending** | Will begin after Phase 1 integration tests pass with per-tenant bundles. |
 | **Phase 3 — Rust Core** | ⏳ **Pending** | Production storage engine rewrite for memory safety and performance. Go codebase serves as correctness reference. |
 | **Phase 4 — Open Source + Consulting** | ⏳ **Pending** | Public release and migration-consulting practice. |
 

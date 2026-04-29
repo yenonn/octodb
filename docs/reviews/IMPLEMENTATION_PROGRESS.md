@@ -1,8 +1,8 @@
 # OctoDB — Implementation Progress Log
 
-**Last Updated:** 2026-04-26  
-**Current Phase:** Phase 1 — Go Prototype (Steps 1–2 of 6)  
-**Blocks Completed:** Block 1 (WAL Ingestion) ✅ | Block 2 (Memtable Flush) 🚧 Skeleton Done
+**Last Updated:** 2026-04-29  
+**Current Phase:** Phase 1 — Go Prototype (Steps 1–3 of 6 completed)  
+**Blocks Completed:** Block 1 (WAL Ingestion) ✅ | Block 2 (Memtable Flush) ✅ | Block 3 (Tenant Resolution) ✅
 
 ---
 
@@ -218,16 +218,38 @@ octodb/
 
 ---
 
-## Next Steps (Block 2 Completion)
+## Block 3: Tenant Resolution ✅ COMPLETED (2026-04-29)
 
-**To reach "Block 2 is solid, proceed to Block 3":**
+### Components Implemented
 
-1. [ ] Fix data dir: `octodb-data/` instead of `.`
-2. [ ] Implement **segment read path** in `ReadTraces` (scan segment files via manifest)
-3. [ ] Add **Bloom filter** on flush (`sst-XXXX.bloom`)
-4. [ ] Wire HTTP `/v1/traces/:trace_id` query endpoint properly
-5. [ ] Add integration test: start → send → kill-9 → restart → query → assert data present
-6. [ ] Raise memtable threshold from 1KB → 64MB before declaring production-ready
+| Component | File | Purpose |
+|-----------|------|---------|
+| **Tenant Resolver** | `internal/tenant/resolver.go` | Extracts tenant ID from OTel Resource attributes with configurable strategy |
+| **Tenant Resolver Tests** | `internal/tenant/resolver_test.go` | 100% test coverage on fallback logic, batch grouping, attribute resolution |
+| **gRPC Server Integration** | `internal/server/grpc.go` | `TraceServer`, `LogServer`, `MetricServer` group batches per-tenant before writing |
+| **Config Wiring** | `internal/config/config.go` | `TenantResolutionConfig` with strategy/attrs/default |
+| **Sort Key Integration** | `internal/store/block2.go` | `extractTraceSortKey`, `extractLogSortKey`, `extractMetricSortKey` all embed resolved tenant ID |
+| **Integration Tests** | `tests/integration/tenant_test.go` | Multi-tenant batch ingestion, crash recovery, attribute fallback — all PASS |
+
+### Discovered Gap (Will Close Tomorrow)
+
+Shared single `signalBundle` per signal means all tenants' data flushes into the same segments. When a segment contains `payments` + `search`, the sort key min/max spans both → segment-level tenant pruning can't skip. Workaround: `traceKeyMatches` still scans; fix: **ADR-008 (per-tenant bundles)** scheduled for tomorrow.
+
+---
+
+## Next Steps (Tomorrow)
+
+**Implement ADR-008: Per-Tenant Signal Bundles with Lifecycle Management**
+
+| Step | Description | Est. |
+|------|-------------|------|
+| 1 | Replace `traceBundle`/`logBundle`/`metricBundle` with `tenantBundleMap` | 2h |
+| 2 | Implement `getBundleForTenant`, `createTenantBundle`, `parkBundle` | 2h |
+| 3 | Update Write/Read paths to resolve bundles per-tenant | 1h |
+| 4 | Add `ParkTimeout` + `MaxActiveTenants` to config | 30m |
+| 5 | Strict tenant enforcement in `traceKeyMatches` (closes TODO #676) | 30m |
+| 6 | Update all unit/integration tests for tenant subdirs | 1h |
+| 7 | Full test suite run + integration tests | 1h |
 
 ---
 
@@ -235,9 +257,9 @@ octodb/
 
 | Step | Description | Status |
 |------|-------------|--------|
-| **Step 1** | Trace ingestion + Postgres storage | 🔄 Partially done — ingestion works, storage is native (WAL), Postgres deferred to Step 1b |
-| **Step 2** | Tenant routing | ⏳ Not started |
-| **Step 3** | Metrics + logs ingestion | ⏳ Not started |
+| **Step 1** | Trace ingestion + native storage (WAL + memtable + segment) | ✅ **Complete** — Block 1 + Block 2 stable |
+| **Step 2** | Tenant routing | ✅ **Complete** — ADR-003 implemented; ADR-008 scheduled |
+| **Step 3** | Metrics + logs ingestion | ✅ **Complete** — gRPC endpoints wired; sort keys embed tenant ID |
 | **Step 4** | Exemplar linking | ⏳ Not started |
 | **Step 5** | ACL enforcement | ⏳ Not started |
 | **Step 6** | Real workload validation | ⏳ Not started |

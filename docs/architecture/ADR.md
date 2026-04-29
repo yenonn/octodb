@@ -91,10 +91,28 @@ tenant_resolution:
 
 ---
 
-## ADR-004: Attribute-Based Access Control (ABAC) in OTel Vocabulary
+## ADR-008: Per-Tenant Signal Bundles with Lifecycle Management
 
-**Date:** 2026-04  
+**Date:** 2026-04-29  
 **Status:** Accepted
+
+### Context
+Current architecture shares a single WAL + memtable + segment directory for all tenants. While tenant resolution (ADR-003) groups data at ingestion, the storage layer still mixes tenants in the same sorted stream. This creates segment-level pruning inefficiency and weakens crash isolation.
+
+### Decision  
+Each tenant gets an independent `signalBundle` per signal type (traces, logs, metrics). Bundles transition through Active / Parked / Cold lifecycle states to constrain memory and file descriptors.
+
+### Consequences
+- True physical isolation — drop tenant = `rm -rf dataDir/tenant/{id}/`
+- Segment pruning is perfect: a segment contains exactly one tenant
+- Bounded resources: only active tenant bundles hold open files + memtables
+- Per-tenant backup, restore, and migration are simple directory operations
+- Crash of one tenant's bundle doesn't affect others
+
+### Full Spec
+See [`docs/superpowers/specs/2026-04-29-per-tenant-segment-isolation.md`](../superpowers/specs/2026-04-29-per-tenant-segment-isolation.md)
+
+---
 
 ### Context
 Existing observability backends either have no ACL, coarse tenant isolation, or require mapping OTel attributes to a foreign permission model. None express permissions in OTel's own vocabulary.

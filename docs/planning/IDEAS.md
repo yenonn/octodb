@@ -223,10 +223,19 @@ Scalability is explicitly **not** a Phase 1–3 concern. Rationale:
 
 While not designing for scale, these design choices keep the door open:
 
-- **Tenant isolation by design** — tenant-partitioned data is naturally shardable (one tenant = one shard candidate)
+- **Tenant isolation by design (ADR-008)** — per-tenant bundles are naturally shardable; one tenant = one shard candidate
 - **Stateless ingestion/query layer** — gRPC receiver and query API are stateless, horizontally scalable in front of storage
 - **WAL as ingestion boundary** — decouples ingestion rate from storage write rate, the first scaling lever needed
 - **Clean storage interface** — storage engine is behind a Go interface, replaceable without touching upper layers
+
+### Multi-Tenancy Resource Management (ADR-008)
+
+For SaaS platforms with 1K–10K tenants, per-tenant bundles solve resource pressure:
+
+- **Memory bounded:** Only active bundles hold memtables (~100–500 typically hot)
+- **FD bounded:** Only active bundles hold open WAL files
+- **Lifecycle states:** Active → Parked → Cold transitions prevent unbounded growth
+- **Per-tenant eviction:** LRU or idle-timeout eviction frees resources for inactive tenants
 
 ### When to Revisit
 
