@@ -1185,30 +1185,11 @@ func (s *block2Store) ReadTraces(ctx context.Context, req TraceReadRequest) ([]*
 }
 
 func (s *block2Store) traceKeyMatches(rs tracepb.ResourceSpans, req TraceReadRequest) bool {
-	svc, spanTenant := "", ""
+	svc := ""
 	if rs.Resource != nil {
 		for _, a := range rs.Resource.Attributes {
 			if a.Key == "service.name" {
 				svc = a.Value.GetStringValue()
-<<<<<<< HEAD
-			}
-			if a.Key == "tenant.id" || a.Key == "tenant_id" || a.Key == "k8s.namespace.name" {
-				spanTenant = a.Value.GetStringValue()
-			}
-		}
-	}
-	if spanTenant == "" {
-		spanTenant = "default"
-	}
-
-	reqTenant := req.TenantID
-	if reqTenant == "" {
-		reqTenant = "default"
-	}
-	if spanTenant != reqTenant {
-		return false
-	}
-=======
 			}
 		}
 	}
@@ -1216,7 +1197,6 @@ func (s *block2Store) traceKeyMatches(rs tracepb.ResourceSpans, req TraceReadReq
 	// Tenant is implicit in the per-tenant bundle — no need to check span attributes.
 	// The bundle itself enforces tenant isolation.
 
->>>>>>> feature/per-tenant-bundles
 	if req.Service != "" && svc != req.Service {
 		return false
 	}
