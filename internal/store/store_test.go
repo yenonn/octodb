@@ -320,14 +320,10 @@ func TestMixedSignals(t *testing.T) {
 		t.Fatal("expected log to have scope logs")
 	}
 
-	// Verify per-signal WAL files exist.
-	traceWAL := filepath.Join(dataDir, "traces", "000001.wal")
-	logWAL := filepath.Join(dataDir, "logs", "000001.wal")
-	if _, err := os.Stat(traceWAL); os.IsNotExist(err) {
-		t.Fatal("trace WAL missing")
-	}
-	if _, err := os.Stat(logWAL); os.IsNotExist(err) {
-		t.Fatal("log WAL missing")
+	// Verify the WAL file exists at per-tenant location.
+	tenantWAL := filepath.Join(dataDir, "tenant", "default", "000001.wal")
+	if _, err := os.Stat(tenantWAL); os.IsNotExist(err) {
+		t.Fatal("tenant WAL missing")
 	}
 }
 
@@ -524,12 +520,10 @@ func TestMixedAllSignals(t *testing.T) {
 		t.Fatalf("expected 1 metric, got %d", len(mr))
 	}
 
-	// Verify per-signal WALs exist.
-	for _, sub := range []string{"traces/000001.wal", "logs/000001.wal", "metrics/000001.wal"} {
-		p := filepath.Join(dataDir, sub)
-		if _, err := os.Stat(p); os.IsNotExist(err) {
-			t.Fatalf("missing %s", p)
-		}
+	// Verify single WAL at per-tenant location.
+	tenantWAL := filepath.Join(dataDir, "tenant", "default", "000001.wal")
+	if _, err := os.Stat(tenantWAL); os.IsNotExist(err) {
+		t.Fatalf("missing %s", tenantWAL)
 	}
 }
 
@@ -800,8 +794,8 @@ func TestTTLRemovesOldSegments(t *testing.T) {
 	_ = st.WriteTraces(ctx, "default", []*tracepb.ResourceSpans{span})
 	st.Close() // explicit flush, skip defer
 
-	// Verify segment exists.
-	entries, _ := os.ReadDir(filepath.Join(dataDir, "traces"))
+	// Verify segment exists in per-tenant location.
+	entries, _ := os.ReadDir(filepath.Join(dataDir, "tenant", "default"))
 	var hasSegment bool
 	for _, e := range entries {
 		if filepath.Ext(e.Name()) == ".pb" {
@@ -853,16 +847,20 @@ func TestCompactionMergesSegments(t *testing.T) {
 	defer st3.Close()
 
 	s3 := st3.(*block2Store)
-	if err := s3.compactBundle(s3.traceBundle); err != nil {
+	def, err := s3.defaultTenantBundle()
+	if err != nil {
+		t.Fatalf("default bundle: %v", err)
+	}
+	if err := s3.compactTenantBundle(def); err != nil {
 		t.Fatalf("compaction: %v", err)
 	}
 
-	records := s3.traceBundle.man.AllRecords()
+	records := def.man.AllRecords()
 	if len(records) == 0 {
 		t.Fatal("expected at least 1 record after compaction")
 	}
 
-	entries, _ := os.ReadDir(filepath.Join(dataDir, "traces"))
+	entries, _ := os.ReadDir(filepath.Join(dataDir, "tenant", "default"))
 	var pbCount int
 	for _, e := range entries {
 		if filepath.Ext(e.Name()) == ".pb" {
@@ -1034,7 +1032,11 @@ func TestSweepBundleTTLWithExpiredSegments(t *testing.T) {
 	defer st2.Close()
 
 	s := st2.(*block2Store)
-	records := s.traceBundle.man.AllRecords()
+	def, err := s.defaultTenantBundle()
+	if err != nil {
+		t.Fatalf("default bundle: %v", err)
+	}
+	records := def.man.AllRecords()
 	if len(records) == 0 {
 		t.Fatal("expected segments before sweep")
 	}
@@ -1047,12 +1049,12 @@ func TestSweepBundleTTLWithExpiredSegments(t *testing.T) {
 		rec.CreatedAt = 1
 		newRecs = append(newRecs, rec)
 	}
-	_ = s.traceBundle.man.CompactRecords(oldSeqs, newRecs)
+	_ = def.man.CompactRecords(oldSeqs, newRecs)
 
-	s.traceBundle.retention = time.Nanosecond
-	s.sweepBundleTTL(s.traceBundle)
+	def.retention = time.Nanosecond
+	s.sweepTenantBundleTTL(def)
 
-	afterRecords := len(s.traceBundle.man.AllRecords())
+	afterRecords := len(def.man.AllRecords())
 	if afterRecords >= len(records) {
 		t.Fatalf("expected fewer records after sweep, before=%d after=%d", len(records), afterRecords)
 	}
@@ -1106,21 +1108,21 @@ func TestWALRotationAfterFlush(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	tracesDir := filepath.Join(dataDir, "traces")
+	tenantDir := filepath.Join(dataDir, "tenant", "default")
 
-	walBefore := filepath.Join(tracesDir, "000001.wal")
+	walBefore := filepath.Join(tenantDir, "000001.wal")
 	if _, err := os.Stat(walBefore); err != nil {
 		t.Fatalf("expected WAL 000001.wal, not found: %v", err)
 	}
 
 	st.Close()
 
-	tombstone := filepath.Join(tracesDir, "000001.wal.tombstone")
+	tombstone := filepath.Join(tenantDir, "000001.wal.tombstone")
 	if _, err := os.Stat(tombstone); err != nil {
 		t.Fatalf("expected WAL tombstone after flush, not found: %v", err)
 	}
 
-	newWal := filepath.Join(tracesDir, "000002.wal")
+	newWal := filepath.Join(tenantDir, "000002.wal")
 	if _, err := os.Stat(newWal); err != nil {
 		t.Fatalf("expected new WAL 000002.wal after flush, not found: %v", err)
 	}
@@ -1149,7 +1151,7 @@ func TestWALMultiFileReplay(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	tracesDir := filepath.Join(dataDir, "traces")
+	tracesDir := filepath.Join(dataDir, "tenant", "default")
 	walFilesBefore, _ := filepath.Glob(filepath.Join(tracesDir, "*.wal"))
 
 	st.Close()
@@ -1177,7 +1179,7 @@ func TestWALMultiFileReplay(t *testing.T) {
 func TestWALTombstoneCleanup(t *testing.T) {
 	st, dataDir := setupTestStore(t)
 
-	tracesDir := filepath.Join(dataDir, "traces")
+	tracesDir := filepath.Join(dataDir, "tenant", "default")
 	tombstone1 := filepath.Join(tracesDir, "000001.wal.tombstone")
 	tombstone2 := filepath.Join(tracesDir, "000002.wal.tombstone")
 
@@ -1188,8 +1190,11 @@ func TestWALTombstoneCleanup(t *testing.T) {
 		t.Fatalf("create tombstone2: %v", err)
 	}
 
-	b := st.(*block2Store).traceBundle
-	st.(*block2Store).cleanupWALTombstones(b)
+	b, err := st.(*block2Store).defaultTenantBundle()
+	if err != nil {
+		t.Fatalf("default bundle: %v", err)
+	}
+	st.(*block2Store).cleanupTenantWALTombstones(b)
 
 	if _, err := os.Stat(tombstone1); !os.IsNotExist(err) {
 		t.Fatalf("expected tombstone1 deleted, still exists")
@@ -1201,12 +1206,12 @@ func TestWALTombstoneCleanup(t *testing.T) {
 	st.Close()
 }
 
-// TestWALStartupNoFiles starts with empty directory, verifies 000001.wal created.
+	// TestWALStartupNoFiles starts with empty directory, verifies 000001.wal created.
 func TestWALStartupNoFiles(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "data")
 
-	if err := os.MkdirAll(filepath.Join(dataDir, "traces"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(dataDir, "tenant", "default"), 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 
@@ -1215,7 +1220,7 @@ func TestWALStartupNoFiles(t *testing.T) {
 		t.Fatalf("open store: %v", err)
 	}
 
-	tracesDir := filepath.Join(dataDir, "traces")
+	tracesDir := filepath.Join(dataDir, "tenant", "default")
 	wal := filepath.Join(tracesDir, "000001.wal")
 	if _, err := os.Stat(wal); os.IsNotExist(err) {
 		t.Fatalf("expected 000001.wal on empty dir, not found")
@@ -1228,7 +1233,7 @@ func TestWALStartupNoFiles(t *testing.T) {
 func TestWALStartupResumeHighest(t *testing.T) {
 	dir := t.TempDir()
 	dataDir := filepath.Join(dir, "data")
-	tracesDir := filepath.Join(dataDir, "traces")
+	tracesDir := filepath.Join(dataDir, "tenant", "default")
 
 	if err := os.MkdirAll(tracesDir, 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -1245,8 +1250,12 @@ func TestWALStartupResumeHighest(t *testing.T) {
 	}
 
 	b := st.(*block2Store)
-	if b.traceBundle.walSeq != 3 {
-		t.Fatalf("expected walSeq=3, got %d", b.traceBundle.walSeq)
+	def, err := b.defaultTenantBundle()
+	if err != nil {
+		t.Fatalf("default bundle: %v", err)
+	}
+	if def.walSeq != 3 {
+		t.Fatalf("expected walSeq=3, got %d", def.walSeq)
 	}
 
 	st.Close()
@@ -1754,13 +1763,17 @@ func TestCompactionRebuildsTraceIndex(t *testing.T) {
 	defer st.Close()
 
 	// Verify we have at least 2 records before compaction.
-	recordsBefore := st.(*block2Store).traceBundle.man.AllRecords()
+	s := st.(*block2Store)
+	def, err := s.defaultTenantBundle()
+	if err != nil {
+		t.Fatalf("default bundle: %v", err)
+	}
+	recordsBefore := def.man.AllRecords()
 	if len(recordsBefore) < 2 {
 		t.Fatalf("expected at least 2 records before compaction, got %d", len(recordsBefore))
 	}
 
-	s := st.(*block2Store)
-	if err := s.compactBundle(s.traceBundle); err != nil {
+	if err := s.compactTenantBundle(def); err != nil {
 		t.Fatalf("compaction: %v", err)
 	}
 

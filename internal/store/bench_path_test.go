@@ -28,7 +28,7 @@ func BenchmarkWritePathSortKeyOnly(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		store.extractTraceSortKey(raw)
+		store.extractTraceSortKey("default", raw)
 	}
 	b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "keys/sec")
 }
