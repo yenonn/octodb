@@ -89,7 +89,7 @@ func TestBlock1_WALCrashRecovery(t *testing.T) {
 	sendExport(t, dataDir, buildTestResourceSpans("integration-test-svc", "test-span"))
 
 	// --- Step 3: Verify WAL has bytes ---
-	walPath := filepath.Join(dataDir, "traces", "000001.wal")
+	walPath := filepath.Join(dataDir, "tenant", "default", "000001.wal")
 	info, err := os.Stat(walPath)
 	if err != nil {
 		t.Fatalf("wal stat: %v", err)

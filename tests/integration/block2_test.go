@@ -41,7 +41,7 @@ func TestBlock2_FlushAndQuery(t *testing.T) {
 	time.Sleep(3 * time.Second)
 
 	// Verify flush artifacts.
-	traceDir := filepath.Join(dataDir, "traces")
+	traceDir := filepath.Join(dataDir, "tenant", "default")
 	manifestPath := filepath.Join(traceDir, "manifest.log")
 	checkpointPath := filepath.Join(traceDir, "manifest.log.checkpoint")
 	assertFileExists(t, manifestPath, 1)
@@ -150,7 +150,7 @@ func TestBlock2_LogFlushAndQuery(t *testing.T) {
 
 	time.Sleep(3 * time.Second)
 
-	logDir := filepath.Join(dataDir, "logs")
+	logDir := filepath.Join(dataDir, "tenant", "default")
 	manifestPath := filepath.Join(logDir, "manifest.log")
 	assertFileExists(t, manifestPath, 1)
 
