@@ -136,15 +136,15 @@ func NewSet() *Set {
 
 // Insert writes an item into the active memtable.
 func (s *Set) Insert(key Key, value []byte) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.active.Insert(key, value)
 }
 
 // InsertTombstone writes a tombstone into the active memtable.
 func (s *Set) InsertTombstone(key Key) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.active.InsertTombstone(key)
 }
 
