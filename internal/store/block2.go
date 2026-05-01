@@ -45,14 +45,21 @@ const MemtableMaxIdleFlush = 30 * time.Second
 // StoreConfig holds tunable parameters for the block2 store.
 type StoreConfig struct {
 	MemtableFlushThreshold int64
-	WALSyncInterval       time.Duration // WAL sync interval (default 10ms) - shorter = more durable, slower = faster
+	WALSyncInterval          time.Duration // default 10ms
+	// Tenant lifecycle (Rev 2): durations for Active→Parked→Cold transitions.
+	ParkTimeout      time.Duration // default 30s
+	ColdTimeout      time.Duration // default 5m
+	MaxActiveTenants int           // default 500
 }
 
 // DefaultStoreConfig returns production defaults.
 func DefaultStoreConfig() StoreConfig {
 	return StoreConfig{
 		MemtableFlushThreshold: DefaultMemtableFlushThreshold,
-		WALSyncInterval:       10 * time.Millisecond,
+		WALSyncInterval:        10 * time.Millisecond,
+		ParkTimeout:            30 * time.Second,
+		ColdTimeout:            5 * time.Minute,
+		MaxActiveTenants:       500,
 	}
 }
 
@@ -69,6 +76,63 @@ type signalBundle struct {
 	lastWrite  time.Time                       // last time data was written to memtable
 	retention  time.Duration                  // TTL for this signal type (default = 7 days)
 	compactInterval time.Duration             // compaction ticker interval
+}
+
+// BundleState represents the lifecycle state of a tenant bundle.
+type BundleState int
+
+const (
+	StateActive    BundleState = iota // serving reads and writes
+	StateParked                       // memtable flushed, WAL closed, reads from segments
+	StateCold                         // no recent activity, minimal resources
+	StateUnhealthy                    // encountered an error, retry scheduled
+)
+
+func (s BundleState) String() string {
+	switch s {
+	case StateActive:
+		return "active"
+	case StateParked:
+		return "parked"
+	case StateCold:
+		return "cold"
+	case StateUnhealthy:
+		return "unhealthy"
+	default:
+		return fmt.Sprintf("BundleState(%d)", s)
+	}
+}
+
+// tenantBundle holds everything for a single tenant's signal data.
+type tenantBundle struct {
+	tenantID string
+	dataDir  string // e.g. dataDir/tenant/{tenantID}/
+
+	walDir  string
+	walSeq  int64
+	wal     *wal.Writer
+	set     *memtable.Set
+	man     *manifest.Manager
+	locator *index.TraceLocator
+
+	state      BundleState
+	stateErr   error
+	retryAfter time.Time
+
+	lastWrite time.Time
+	lastRead  time.Time
+
+	mu sync.RWMutex
+}
+
+// walPath returns the active WAL file path.
+func (b *tenantBundle) walPath() string {
+	return filepath.Join(b.walDir, fmt.Sprintf("%06d.wal", b.walSeq))
+}
+
+// walFileName returns the active WAL file name (without directory).
+func (b *tenantBundle) walFileName() string {
+	return fmt.Sprintf("%06d.wal", b.walSeq)
 }
 
 // walPath returns the active WAL file path.
@@ -95,13 +159,140 @@ type block2Store struct {
 	dataDir string
 	cfg     StoreConfig
 
+	// Legacy signal bundles (pre per-tenant refactor):
 	traceBundle  *signalBundle
 	logBundle    *signalBundle
 	metricBundle *signalBundle
 
+	tenantMap sync.Map // tenantID -> *tenantBundle
+
 	stopFlush chan struct{}
 	flushDone sync.WaitGroup
 	closeOnce sync.Once
+}
+
+// ---------------------------------------------------------------------------
+// Per-tenant bundle lifecycle
+// ---------------------------------------------------------------------------
+
+func (s *block2Store) getBundleForTenant(tenantID string) (*tenantBundle, error) {
+	// Phase 1: Check sync.Map (no locks held)
+	if val, ok := s.tenantMap.Load(tenantID); ok {
+		b := val.(*tenantBundle)
+		b.mu.RLock()
+		state := b.state
+		stateErr := b.stateErr
+		b.mu.RUnlock()
+		if state == StateUnhealthy {
+			return nil, stateErr
+		}
+		return b, nil
+	}
+
+	// Phase 2: Create bundle from disk
+	b := &tenantBundle{
+		tenantID: tenantID,
+		dataDir:  filepath.Join(s.dataDir, "tenant", tenantID),
+		state:    StateCold,
+		walDir:   s.dataDir,
+	}
+
+	// Phase 3: Build bundle (may fail → Unhealthy)
+	if err := s.buildBundle(b); err != nil {
+		b.mu.Lock()
+		b.state = StateUnhealthy
+		b.stateErr = err
+		b.retryAfter = time.Now().Add(5 * time.Second)
+		b.mu.Unlock()
+		s.tenantMap.Store(tenantID, b)
+		return nil, err
+	}
+
+	b.mu.Lock()
+	b.state = StateActive
+	b.mu.Unlock()
+	s.tenantMap.Store(tenantID, b)
+	return b, nil
+}
+
+func (s *block2Store) buildBundle(b *tenantBundle) error {
+	if err := os.MkdirAll(b.dataDir, 0755); err != nil {
+		return err
+	}
+
+	walSeq := highestWALSeq(b.walDir)
+	if walSeq == 0 {
+		walSeq = 1
+	}
+
+	walPath := filepath.Join(b.walDir, fmt.Sprintf("%06d.wal", walSeq))
+	w, err := wal.OpenAsync(walPath, s.cfg.WALSyncInterval)
+	if err != nil {
+		return fmt.Errorf("wal open %s: %w", walPath, err)
+	}
+
+	m, err := manifest.Open(b.dataDir)
+	if err != nil {
+		_ = w.Close()
+		return fmt.Errorf("manifest open %s: %w", b.dataDir, err)
+	}
+
+	b.walSeq = walSeq
+	b.wal = w
+	b.man = m
+	b.set = memtable.NewSet()
+	b.locator = index.NewTraceLocator()
+
+	if err := s.rebuildTenantLocator(b); err != nil {
+		return err
+	}
+	if err := s.replayTenantBundle(b); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *block2Store) rebuildTenantLocator(b *tenantBundle) error {
+	for _, rec := range b.man.AllRecords() {
+		idxPath := filepath.Join(b.dataDir, rec.SegmentFile+".trace.index")
+		idx, err := index.LoadSegmentTraceIndex(idxPath)
+		if err != nil {
+			continue
+		}
+		b.locator.Merge(rec.Sequence, idx)
+	}
+	return nil
+}
+
+func (s *block2Store) replayTenantBundle(b *tenantBundle) error {
+	cp, err := b.man.ReadCheckpoint()
+	if err != nil {
+		return fmt.Errorf("replay: read checkpoint: %w", err)
+	}
+
+	walFiles := listWALFiles(b.walDir)
+	if len(walFiles) == 0 {
+		return nil
+	}
+
+	for _, wf := range walFiles {
+		walPath := filepath.Join(b.walDir, wf.name)
+
+		var startOffset int64
+		if cp.File != "" && wf.name == cp.File {
+			startOffset = cp.Offset
+		} else if cp.File != "" && wf.seq < walSeqFromName(cp.File) {
+			continue
+		}
+
+		if err := replayWALFile(walPath, startOffset, func(raw []byte) {
+			key, data := s.extractTraceSortKey(raw)
+			b.set.Insert(key, data)
+		}); err != nil {
+			return fmt.Errorf("replay %s: %w", wf.name, err)
+		}
+	}
+	return nil
 }
 
 // NewBlock2Store creates a store with test-friendly defaults (1KB flush threshold).
