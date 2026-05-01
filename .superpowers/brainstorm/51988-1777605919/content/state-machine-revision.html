@@ -1,0 +1,96 @@
+<h2>ADR-008 Per-Tenant Bundles: State Machine Revision</h2>
+<p class="subtitle">Comparing current design vs revised design with critical fixes</p>
+
+<div class="section">
+  <div class="label">Current Design (from existing spec)</div>
+  <div class="mockup">
+    <div class="mockup-header">Active → Parked → Cold</div>
+    <div class="mockup-body" style="font-family:monospace; font-size:12px;">
+      <pre style="margin:0; line-height:1.6;">
+        ┌────────────┐
+   write│            │ idle timeout
+┌──────►│   PARKED   ├───────►┌────────┐
+│      │            │        │  COLD  │
+│      └────────────┘        └────────┘
+│            ▲                     │
+│            │ write                 │ read (lazy warmup)
+│            │                      │
+│     ┌──────┴──────┐               │
+│     │   ACTIVE    │◄──────────────┘
+└─────┤             │
+      │ WAL open    │
+      │ memtable hot│
+      └─────────────┘
+
+      <b>Problems:</b>
+      • No error state — WAL corruption = panic or silent failure
+      • No lock ordering defined — eviction can deadlock with writes
+      • Cold→Active rebuilds locator (unbounded memory for 10K tenants)
+      </pre>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="label">Revised Design</div>
+  <div class="mockup">
+    <div class="mockup-header">Active → Parked → Cold → Unhealthy</div>
+    <div class="mockup-body" style="font-family:monospace; font-size:12px;">
+      <pre style="margin:0; line-height:1.6;">
+        ┌────────────┐     failure     ┌────────────┐
+   write│            ├──────────────►│  UNHEALTHY │
+┌──────►│   PARKED   │   (retry)     │   (err)    │
+│      │            │◄──────────────┘            │
+│      └─────┬──────┘        backoff              │
+│            │ idle timeout                       │
+│            ▼                                    │
+│      ┌──────────┐                               │
+│      │   COLD   │                               │
+│      │(no RAM)  │                               │
+│      └─────┬────┘                               │
+│            │ read                               │
+│            │ (lazy)                             │
+│            ▼                                    │
+│      ┌──────────┐◄───────────────────────────────┘
+│      │  ACTIVE  │
+└──────┤          │
+       │ WAL open │
+       │ locator  │
+       │ memtable │
+       └──────────┘
+
+      <b>Critical Fixes:</b>
+      • UNHEALTHY state for WAL corruption / disk errors
+      • Lock ordering: tenantMapMu → bundle.mu (never reverse)
+      • Cold drops locator from RAM (rebuild on warmup)
+      • Eviction removes from map BEFORE locking bundle
+      </pre>
+    </div>
+  </div>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="current" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Keep Current Design</h3>
+      <p>Implement Approach C as originally specified. Add error handling later if needed.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="revised" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Use Revised Design</h3>
+      <p>Add Unhealthy state, define lock ordering, and drop Cold locator before implementing.</p>
+    </div>
+  </div>
+  <div class="option" data-choice="hybrid" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Hybrid — Incremental</h3>
+      <p>Implement basic per-tenant bundles first, add Unhealthy state and memory optimizations in follow-up.</p>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle">Which direction feels right for the revised ADR-008?</p>

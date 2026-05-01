@@ -1,0 +1,145 @@
+<h2>ADR-008 Rev 2: Section 2 — Lifecycle State Machine & Transitions</h2>
+<p class="subtitle">How bundles move between states, what triggers transitions, and what happens on failure</p>
+
+<div class="section">
+  <div class="label">State Definitions</div>
+  <div class="options">
+    <div class="option" data-choice="active" onclick="toggleSelect(this)">
+      <div class="letter">A</div>
+      <div class="content">
+        <h3>ACTIVE</h3>
+        <p>WAL open and appending. Memtable hot (dual rotation). Locator in RAM. File descriptors: 1 (WAL) + memtable overhead. Can read and write.</p>
+      </div>
+    </div>
+    <div class="option" data-choice="parked" onclick="toggleSelect(this)">
+      <div class="letter">P</div>
+      <div class="content">
+        <h3>PARKED</h3>
+        <p>WAL closed, flushed to segment. Memtable empty. Locator in RAM (for fast reads). File descriptors: 0. Can read; write transitions to Active.</p>
+      </div>
+    </div>
+    <div class="option" data-choice="cold" onclick="toggleSelect(this)">
+      <div class="letter">C</div>
+      <div class="content">
+        <h3>COLD</h3>
+        <p>WAL closed, flushed to segment. Memtable empty. Locator NOT in RAM (loaded lazily on first read). File descriptors: 0. Read triggers Cold→Active rebuild.</p>
+      </div>
+    </div>
+    <div class="option" data-choice="unhealthy" onclick="toggleSelect(this)">
+      <div class="letter">U</div>
+      <div class="content">
+        <h3>UNHEALTHY</h3>
+        <p>Bundle failed to transition (WAL corruption, disk error, manifest failure). stateErr records the error. retryAfter controls backoff. Read/write return errors to caller.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="label">Transition Diagram</div>
+  <div class="mockup">
+    <div class="mockup-body" style="font-family:monospace; font-size:11px;">
+      <pre style="margin:0; line-height:1.6;">
+                        ┌────────────────────────────────────────┐
+                        │  NOT_FOUND (on disk but not in map)  │
+                        └──────────────┬─────────────────────────┘
+                                       │ getBundleForTenant()
+                                       ▼
+                              ┌────────────────┐
+                              │     COLD       │
+                              │  (locator=nil) │
+                              └───────┬────────┘
+                                      │ write / read
+                                      ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │                         ACTIVE                               │
+  │  WAL open, memtable hot, locator in RAM, bundle.mu held      │
+  └────────────┬────────────────────┬────────────────────────────┘
+               │ idle > ParkTimeout │          │ flush error / WAL corruption
+               ▼                    │          ▼
+        ┌────────────┐             │   ┌─────────────┐
+        │   PARKED   │◄─────────────┘   │  UNHEALTHY  │
+        │  (no WAL)  │                  │   (err)     │
+        └─────┬──────┘                  └──────┬──────┘
+              │ idle > ColdTimeout              │ retryAfter elapsed
+              ▼                                 │ (exponential backoff)
+         ┌─────────┐                            │
+         │  COLD   │                            ▼
+         │(no RAM) │────────────────────────►  ACTIVE (rebuild attempt)
+         └─────────┘
+      </pre>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="label">Transition Triggers</div>
+  <table style="width:100%; border-collapse:collapse; font-size:12px;">
+    <tr style="background:#f5f5f5;">
+      <th style="text-align:left; padding:8px; border:1px solid #ddd;">Transition</th>
+      <th style="text-align:left; padding:8px; border:1px solid #ddd;">Trigger</th>
+      <th style="text-align:left; padding:8px; border:1px solid #ddd;">Action</th>
+    </tr>
+    <tr>
+      <td style="padding:8px; border:1px solid #ddd;"><b>NotFound → Cold</b></td>
+      <td style="padding:8px; border:1px solid #ddd;">First access (read or write) for tenant</td>
+      <td style="padding:8px; border:1px solid #ddd;">Check disk: if segments exist → Cold (no locator). If nothing on disk → Cold (empty).</td>
+    </tr>
+    <tr>
+      <td style="padding:8px; border:1px solid #ddd;"><b>Cold → Active</b></td>
+      <td style="padding:8px; border:1px solid #ddd;">WriteTraces/ReadTraces called</td>
+      <td style="padding:8px; border:1px solid #ddd;">Open WAL (new or append), rebuild locator from .trace.index files, create memtable, replay WAL.</td>
+    </tr>
+    <tr>
+      <td style="padding:8px; border:1px solid #ddd;"><b>Parked → Active</b></td>
+      <td style="padding:8px; border:1px solid #ddd;">WriteTraces called</td>
+      <td style="padding:8px; border:1px solid #ddd;">Reopen WAL in append mode, memtable stays empty (data already in segment). Fast.</td>
+    </tr>
+    <tr>
+      <td style="padding:8px; border:1px solid #ddd;"><b>Active → Parked</b></td>
+      <td style="padding:8px; border:1px solid #ddd;">time.Since(lastWrite) > ParkTimeout (default 30s)</td>
+      <td style="padding:8px; border:1px solid #ddd;">Flush memtable → segment → fsync → write checkpoint → close WAL. Keep locator in RAM.</td>
+    </tr>
+    <tr>
+      <td style="padding:8px; border:1px solid #ddd;"><b>Parked → Cold</b></td>
+      <td style="padding:8px; border:1px solid #ddd;">time.Since(lastRead) > ColdTimeout (default 5min) OR LRU eviction</td>
+      <td style="padding:8px; border:1px solid #ddd;">Drop locator from RAM. Bundle stays in sync.Map (for fast existence check).</td>
+    </tr>
+    <tr>
+      <td style="padding:8px; border:1px solid #ddd;"><b>Any → Unhealthy</b></td>
+      <td style="padding:8px; border:1px solid #ddd;">WAL open fails, manifest append fails, flush fsync fails</td>
+      <td style="padding:8px; border:1px solid #ddd;">Record stateErr, set retryAfter=now+5s. Return error to caller.</td>
+    </tr>
+    <tr>
+      <td style="padding:8px; border:1px solid #ddd;"><b>Unhealthy → Active</b></td>
+      <td style="padding:8px; border:1px solid #ddd;">Lifecycle monitor: now > retryAfter</td>
+      <td style="padding:8px; border:1px solid #ddd;">Attempt full rebuild (same as Cold→Active). If fails → double retryAfter (5→10→30→60s max).</td>
+    </tr>
+  </table>
+</div>
+
+<div class="section">
+  <div class="label">Critical: No Deadlock Guarantee</div>
+  <div class="pros-cons">
+    <div class="pros">
+      <h4>Lock Hierarchy (enforced)</h4>
+      <ul>
+        <li>sync.Map ops: no explicit lock (Go runtime handles)</li>
+        <li>bundle.mu: ONLY for bundle mutable fields</li>
+        <li>Rule: NEVER hold bundle.mu while calling sync.Map.Store/Load</li>
+        <li>Rule: eviction removes from sync.Map FIRST, then locks bundle.mu</li>
+      </ul>
+    </div>
+    <div class="cons">
+      <h4>What would deadlock (and we avoid)</h4>
+      <ul>
+        <li>❌ Holding bundle.mu → calling sync.Map.Delete</li>
+        <li>✅ sync.Map.Delete → then lock bundle.mu → safe</li>
+        <li>❌ Holding sync.Map lock (if we used RWMutex) → waiting for bundle.mu</li>
+        <li>✅ sync.Map has no user-visible lock → safe</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle">Does this state machine and transition logic look correct? Any missing transitions or edge cases?</p>
