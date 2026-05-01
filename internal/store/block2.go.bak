@@ -7,7 +7,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -179,51 +178,44 @@ type block2Store struct {
 // Per-tenant bundle lifecycle
 // ---------------------------------------------------------------------------
 
-func (s *block2Store) activateTenantBundle(b *tenantBundle) error {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.state == StateUnhealthy {
-		return b.stateErr
-	}
-	if b.state != StateCold {
-		return nil
-	}
-	if b.wal == nil {
-		walSeq := highestWALSeq(b.walDir)
-		if walSeq == 0 {
-			walSeq = 1
-		}
-		w, err := wal.OpenAsync(filepath.Join(b.walDir, fmt.Sprintf("%06d.wal", walSeq)), s.cfg.WALSyncInterval)
-		if err != nil {
-			b.state = StateUnhealthy
-			b.stateErr = err
-			b.retryAfter = time.Now().Add(5 * time.Second)
-			return err
-		}
-		b.walSeq = walSeq
-		b.wal = w
-	}
-	if b.set == nil {
-		b.set = memtable.NewSet()
-	}
-	if b.locator == nil {
-		b.locator = index.NewTraceLocator()
-		_ = s.rebuildTenantLocator(b)
-	}
-	b.state = StateActive
-	return nil
-}
-
 func (s *block2Store) getBundleForTenant(tenantID string) (*tenantBundle, error) {
-	if tenantID == "" {
-		tenantID = "default"
-	}
-
 	// Phase 1: Check sync.Map (no locks held)
 	if val, ok := s.tenantMap.Load(tenantID); ok {
 		b := val.(*tenantBundle)
-		if err := s.activateTenantBundle(b); err != nil {
-			return nil, err
+		b.mu.RLock()
+		state := b.state
+		stateErr := b.stateErr
+		b.mu.RUnlock()
+		if state == StateUnhealthy {
+			return nil, stateErr
+		}
+		if state == StateCold {
+			b.mu.Lock()
+			if b.wal == nil {
+				walSeq := highestWALSeq(b.walDir)
+				if walSeq == 0 {
+					walSeq = 1
+				}
+				w, err := wal.OpenAsync(filepath.Join(b.walDir, fmt.Sprintf("%06d.wal", walSeq)), s.cfg.WALSyncInterval)
+				if err != nil {
+					b.state = StateUnhealthy
+					b.stateErr = err
+					b.retryAfter = time.Now().Add(5 * time.Second)
+					b.mu.Unlock()
+					return nil, err
+				}
+				b.walSeq = walSeq
+				b.wal = w
+			}
+			if b.set == nil {
+				b.set = memtable.NewSet()
+			}
+			if b.locator == nil {
+				b.locator = index.NewTraceLocator()
+				_ = s.rebuildTenantLocator(b)
+			}
+			b.state = StateActive
+			b.mu.Unlock()
 		}
 		return b, nil
 	}
@@ -233,10 +225,10 @@ func (s *block2Store) getBundleForTenant(tenantID string) (*tenantBundle, error)
 		tenantID: tenantID,
 		dataDir:  filepath.Join(s.dataDir, "tenant", tenantID),
 		state:    StateCold,
-		walDir:   filepath.Join(s.dataDir, "tenant", tenantID),
+		walDir:   s.dataDir,
 	}
 
-	// Phase 3: Build bundle (may fail -> Unhealthy)
+	// Phase 3: Build bundle (may fail → Unhealthy)
 	if err := s.buildBundle(b); err != nil {
 		b.mu.Lock()
 		b.state = StateUnhealthy
@@ -247,30 +239,11 @@ func (s *block2Store) getBundleForTenant(tenantID string) (*tenantBundle, error)
 		return nil, err
 	}
 
-	// Phase 4: Activate and atomically publish
-	if err := s.activateTenantBundle(b); err != nil {
-		s.tenantMap.Store(tenantID, b)
-		return nil, err
-	}
-
-	if existingVal, loaded := s.tenantMap.LoadOrStore(tenantID, b); loaded {
-		// Another goroutine won the race; close our WAL.
-		if b.wal != nil {
-			_ = b.wal.Close()
-		}
-		existing := existingVal.(*tenantBundle)
-		if err := s.activateTenantBundle(existing); err != nil {
-			return nil, err
-		}
-		return existing, nil
-	}
-
+	b.mu.Lock()
+	b.state = StateActive
+	b.mu.Unlock()
+	s.tenantMap.Store(tenantID, b)
 	return b, nil
-}
-
-// defaultTenantBundle returns the default tenant bundle from the store.
-func (s *block2Store) defaultTenantBundle() (*tenantBundle, error) {
-	return s.getBundleForTenant("default")
 }
 
 func (s *block2Store) buildBundle(b *tenantBundle) error {
@@ -369,24 +342,18 @@ func (s *block2Store) evictBundle(b *tenantBundle) {
 // parkBundle transitions a bundle from Active -> Parked by flushing memtable and closing WAL.
 func (s *block2Store) parkBundle(b *tenantBundle) error {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	if b.state == StateUnhealthy {
-		b.mu.Unlock()
-		return nil // skip unhealthy bundles
+		return b.stateErr
 	}
 	if b.state != StateActive {
-		b.mu.Unlock()
 		return nil
 	}
-	b.mu.Unlock()
-
 	if b.set != nil && b.set.ActiveSize() > 0 {
 		if err := s.flushTenantBundle(b); err != nil {
 			return fmt.Errorf("parkBundle: flush: %w", err)
 		}
 	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
 	if b.wal != nil {
 		_ = b.wal.Close()
 		b.wal = nil
@@ -542,34 +509,18 @@ func (s *block2Store) replayTenantBundle(b *tenantBundle) error {
 		}
 
 		if err := replayWALFile(walPath, startOffset, func(raw []byte) {
-			// Check for tombstone first (JSON {"deleted":true,"key":...}).
-			var tomb struct {
-				Deleted bool   `json:"deleted"`
-				Key     string `json:"key"`
-			}
-			if err := json.Unmarshal(raw, &tomb); err == nil && tomb.Deleted && tomb.Key != "" {
-				key := memtable.Key{DType: otelutil.TypeTrace, Key: tomb.Key}
-				// Try to infer dtype from key prefix.
-				if strings.HasPrefix(tomb.Key, string(otelutil.TypeLog)) {
-					key.DType = otelutil.TypeLog
-				} else if strings.HasPrefix(tomb.Key, string(otelutil.TypeMetric)) {
-					key.DType = otelutil.TypeMetric
-				}
-				b.set.InsertTombstone(key)
-				return
-			}
 			// Try all three signal-type extractions.
-			key, data := s.extractTraceSortKey(b.tenantID, raw)
+			key, data := s.extractTraceSortKey(raw)
 			if key.Key != "" {
 				b.set.Insert(key, data)
 				return
 			}
-			key, data = s.extractLogSortKey(b.tenantID, raw)
+			key, data = s.extractLogSortKey(raw)
 			if key.Key != "" {
 				b.set.Insert(key, data)
 				return
 			}
-			key, data = s.extractMetricSortKey(b.tenantID, raw)
+			key, data = s.extractMetricSortKey(raw)
 			if key.Key != "" {
 				b.set.Insert(key, data)
 				return
@@ -624,21 +575,21 @@ func (s *block2Store) lazyInitLegacyBundles() error {
 	}
 
 	if err := s.replayBundle(s.traceBundle, func(raw []byte) {
-		key, data := s.extractTraceSortKey("default", raw)
+		key, data := s.extractTraceSortKey(raw)
 		s.traceBundle.set.Insert(key, data)
 	}); err != nil {
 		_ = s.Close()
 		return fmt.Errorf("block2: replay traces: %w", err)
 	}
 	if err := s.replayBundle(s.logBundle, func(raw []byte) {
-		key, data := s.extractLogSortKey("default", raw)
+		key, data := s.extractLogSortKey(raw)
 		s.logBundle.set.Insert(key, data)
 	}); err != nil {
 		_ = s.Close()
 		return fmt.Errorf("block2: replay logs: %w", err)
 	}
 	if err := s.replayBundle(s.metricBundle, func(raw []byte) {
-		key, data := s.extractMetricSortKey("default", raw)
+		key, data := s.extractMetricSortKey(raw)
 		s.metricBundle.set.Insert(key, data)
 	}); err != nil {
 		_ = s.Close()
@@ -691,28 +642,7 @@ func NewBlock2StoreWithConfig(dataDir string, cfg StoreConfig) (Store, error) {
 		return nil, fmt.Errorf("block2: migrate: %w", err)
 	}
 
-	// Create legacy signal bundles for backward compatibility with tests
-	// that access traceBundle/logBundle/metricBundle directly.
-	// Also eagerly create the default tenant bundle.
-	tb, err := s.createBundle("traces", s.cfg.WALSyncInterval)
-	if err != nil {
-		return nil, fmt.Errorf("block2: trace bundle: %w", err)
-	}
-	s.traceBundle = tb
-	lb, err := s.createBundle("logs", s.cfg.WALSyncInterval)
-	if err != nil {
-		return nil, fmt.Errorf("block2: log bundle: %w", err)
-	}
-	s.logBundle = lb
-	mb, err := s.createBundle("metrics", s.cfg.WALSyncInterval)
-	if err != nil {
-		return nil, fmt.Errorf("block2: metric bundle: %w", err)
-	}
-	s.metricBundle = mb
-
-	// Eagerly create default tenant bundle in tenantMap.
-	_, _ = s.getBundleForTenant("default")
-
+	// Lazy initialization: bundles created on first write/read.
 	s.flushDone.Add(1)
 	go s.flushMonitor()
 
@@ -897,14 +827,21 @@ func replayWALFile(path string, offset int64, fn func(raw []byte)) error {
 // Trace sort key / extraction helpers
 // ---------------------------------------------------------------------------
 
-func (s *block2Store) extractTraceSortKey(tenantID string, raw []byte) (memtable.Key, []byte) {
+func (s *block2Store) extractTraceSortKey(raw []byte) (memtable.Key, []byte) {
 	var rs tracepb.ResourceSpans
 	if err := proto.Unmarshal(raw, &rs); err != nil {
 		return memtable.Key{}, nil
 	}
-	svc := ""
+	svc, tenantID := "", ""
 	if rs.Resource != nil {
 		svc = stringAttr(rs.Resource.Attributes, "service.name")
+		tenantID = stringAttr(rs.Resource.Attributes, "tenant.id")
+		if tenantID == "" {
+			tenantID = stringAttr(rs.Resource.Attributes, "tenant_id")
+		}
+		if tenantID == "" {
+			tenantID = stringAttr(rs.Resource.Attributes, "k8s.namespace.name")
+		}
 	}
 	if tenantID == "" {
 		tenantID = "default"
@@ -938,14 +875,21 @@ func (s *block2Store) extractTraceIDFromData(raw []byte) string {
 // Log sort key / extraction helpers
 // ---------------------------------------------------------------------------
 
-func (s *block2Store) extractLogSortKey(tenantID string, raw []byte) (memtable.Key, []byte) {
+func (s *block2Store) extractLogSortKey(raw []byte) (memtable.Key, []byte) {
 	var rl logspb.ResourceLogs
 	if err := proto.Unmarshal(raw, &rl); err != nil {
 		return memtable.Key{}, nil
 	}
-	svc := ""
+	svc, tenantID := "", ""
 	if rl.Resource != nil {
 		svc = stringAttr(rl.Resource.Attributes, "service.name")
+		tenantID = stringAttr(rl.Resource.Attributes, "tenant.id")
+		if tenantID == "" {
+			tenantID = stringAttr(rl.Resource.Attributes, "tenant_id")
+		}
+		if tenantID == "" {
+			tenantID = stringAttr(rl.Resource.Attributes, "k8s.namespace.name")
+		}
 	}
 	if tenantID == "" {
 		tenantID = "default"
@@ -987,14 +931,21 @@ func (s *block2Store) extractLogTraceID(raw []byte) string {
 // Metric sort key / extraction helpers
 // ---------------------------------------------------------------------------
 
-func (s *block2Store) extractMetricSortKey(tenantID string, raw []byte) (memtable.Key, []byte) {
+func (s *block2Store) extractMetricSortKey(raw []byte) (memtable.Key, []byte) {
 	var rm metricspb.ResourceMetrics
 	if err := proto.Unmarshal(raw, &rm); err != nil {
 		return memtable.Key{}, nil
 	}
-	svc := ""
+	svc, tenantID := "", ""
 	if rm.Resource != nil {
 		svc = stringAttr(rm.Resource.Attributes, "service.name")
+		tenantID = stringAttr(rm.Resource.Attributes, "tenant.id")
+		if tenantID == "" {
+			tenantID = stringAttr(rm.Resource.Attributes, "tenant_id")
+		}
+		if tenantID == "" {
+			tenantID = stringAttr(rm.Resource.Attributes, "k8s.namespace.name")
+		}
 	}
 	if tenantID == "" {
 		tenantID = "default"
@@ -1053,9 +1004,6 @@ func (b *signalBundle) flushIdleSize(threshold int64) int64 {
 func (b *tenantBundle) flushTenantIdleSize(threshold int64) int64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
-	if b.set == nil {
-		return 0
-	}
 	if time.Since(b.lastWrite) > MemtableMaxIdleFlush && b.set.ActiveSize() > 0 {
 		return threshold
 	}
@@ -1090,7 +1038,7 @@ func (s *block2Store) WriteTraces(ctx context.Context, tenantID string, spans []
 		return err
 	}
 	for _, data := range batch {
-		key, data2 := s.extractTraceSortKey(tenantID, data)
+		key, data2 := s.extractTraceSortKey(data)
 		bundle.set.Insert(key, data2)
 	}
 	bundle.lastWrite = time.Now()
@@ -1190,7 +1138,6 @@ func (s *block2Store) traceKeyMatches(rs tracepb.ResourceSpans, req TraceReadReq
 		for _, a := range rs.Resource.Attributes {
 			if a.Key == "service.name" {
 				svc = a.Value.GetStringValue()
-<<<<<<< HEAD
 			}
 			if a.Key == "tenant.id" || a.Key == "tenant_id" || a.Key == "k8s.namespace.name" {
 				spanTenant = a.Value.GetStringValue()
@@ -1208,15 +1155,6 @@ func (s *block2Store) traceKeyMatches(rs tracepb.ResourceSpans, req TraceReadReq
 	if spanTenant != reqTenant {
 		return false
 	}
-=======
-			}
-		}
-	}
-
-	// Tenant is implicit in the per-tenant bundle — no need to check span attributes.
-	// The bundle itself enforces tenant isolation.
-
->>>>>>> feature/per-tenant-bundles
 	if req.Service != "" && svc != req.Service {
 		return false
 	}
@@ -1332,7 +1270,7 @@ func (s *block2Store) WriteLogs(ctx context.Context, tenantID string, logs []*lo
 		return err
 	}
 	for _, data := range batch {
-		key, data2 := s.extractLogSortKey(tenantID, data)
+		key, data2 := s.extractLogSortKey(data)
 		bundle.set.Insert(key, data2)
 	}
 	bundle.lastWrite = time.Now()
@@ -1507,7 +1445,7 @@ func (s *block2Store) WriteMetrics(ctx context.Context, tenantID string, metrics
 		return err
 	}
 	for _, data := range batch {
-		key, data2 := s.extractMetricSortKey(tenantID, data)
+		key, data2 := s.extractMetricSortKey(data)
 		bundle.set.Insert(key, data2)
 	}
 	bundle.lastWrite = time.Now()
@@ -1692,17 +1630,9 @@ func (s *block2Store) Close() error {
 		s.flushDone.Wait()
 		s.tenantMap.Range(func(_, val any) bool {
 			b := val.(*tenantBundle)
-			b.mu.RLock()
-			needsFlush := b.set != nil && b.set.ActiveSize() > 0
-			b.mu.RUnlock()
-			if needsFlush {
-				_ = s.flushTenantBundle(b)
-			}
-			b.mu.Lock()
 			if b.wal != nil {
 				_ = b.wal.Close()
 			}
-			b.mu.Unlock()
 			return true
 		})
 		// Close legacy bundles if they exist.

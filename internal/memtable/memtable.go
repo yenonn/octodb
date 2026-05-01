@@ -92,6 +92,16 @@ func (m *Memtable) Ascend(fn func(key Key, value []byte) bool) {
 	})
 }
 
+// AscendAll calls fn for every item including tombstones.
+func (m *Memtable) AscendAll(fn func(key Key, value []byte, deleted bool) bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	m.data.Ascend(func(item btree.Item) bool {
+		it := item.(Item)
+		return fn(it.Key, it.Value, it.Deleted)
+	})
+}
+
 // AscendByType calls fn only for items matching the given data type.
 // Tombstones (Deleted=true) are skipped.
 func (m *Memtable) AscendByType(dtype otelutil.DataType, fn func(key Key, value []byte) bool) {
