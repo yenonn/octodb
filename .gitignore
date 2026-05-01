@@ -15,4 +15,5 @@ amp
 coverage*.out
 *.log
 benchmark_reports/
+.worktrees/
 
